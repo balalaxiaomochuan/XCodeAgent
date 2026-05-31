@@ -1,0 +1,27 @@
+[project]
+name = "xcodeagent"
+version = "0.1.0"
+description = "命令行 AI 编程助手"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.60.0",
+    "rich>=13.0.0",
+    "pyfiglet>=1.0.0",
+]
+
+[project.scripts]
+xcodeagent = "xcodeagent.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["xcodeagent"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.24.0",
+]

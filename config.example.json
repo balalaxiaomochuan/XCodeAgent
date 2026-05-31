@@ -1,0 +1,10 @@
+{
+  "protocol": "anthropic",
+  "model": "claude-sonnet-4-6",
+  "base_url": "https://api.anthropic.com",
+  "api_key": "sk-ant-xxxxxxxxxxxx",
+  "extended_thinking": {
+    "enabled": false,
+    "budget_tokens": 4000
+  }
+}
