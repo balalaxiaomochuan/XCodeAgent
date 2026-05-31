@@ -6,9 +6,7 @@ import asyncio
 import sys
 
 import pyfiglet
-from rich import box
 from rich.console import Console
-from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
@@ -57,38 +55,48 @@ def _print_logo() -> None:
 # ── 状态指示器 ────────────────────────────────────────────
 
 class StatusIndicator:
-    """在终端行内显示异步状态文字（thinking... / output... / completed!）。"""
+    """在终端独立行内显示状态文字。
+
+    三个状态：
+      thinking...  → 灰色，省略号动画循环（1→2→3→1）
+      output...    → 黄色，静态（与流式内容并发安全）
+      completed!   → 绿色，静态
+    """
 
     def __init__(self):
         self._active = False
+
+    # ── thinking 动画（仅在无其他输出时运行，安全）─────
 
     async def thinking(self) -> None:
         """循环动画：thinking. → thinking.. → thinking..."""
         self._active = True
         frames = [
-            "\033[90mthinking.\033[0m  ",
-            "\033[90mthinking..\033[0m ",
-            "\033[90mthinking...\033[0m",
+            "\033[1A\r\033[K\033[90mthinking.\033[0m",
+            "\033[1A\r\033[K\033[90mthinking..\033[0m",
+            "\033[1A\r\033[K\033[90mthinking...\033[0m",
         ]
         i = 0
         while self._active:
-            sys.stdout.write(f"\r\033[K{frames[i % 3]}")
+            sys.stdout.write(f"\0337{frames[i % 3]}\0338")
             sys.stdout.flush()
             i += 1
             await asyncio.sleep(0.4)
-        # 清除状态行
-        sys.stdout.write("\r\033[K")
-        sys.stdout.flush()
 
     def stop(self) -> None:
+        """停止 thinking 动画。"""
         self._active = False
 
+    # ── output / completed 静态（与流式内容安全共存）───
+
     def show_output(self) -> None:
-        sys.stdout.write("\r\033[K\033[93moutput...\033[0m ")
+        """在状态行显示 output...（静态，不循环动画）。"""
+        sys.stdout.write(f"\033[u\033[K\033[93moutput...\033[0m\n")
         sys.stdout.flush()
 
     def show_completed(self) -> None:
-        sys.stdout.write("\r\033[K\033[92mcompleted!\033[0m")
+        """在状态行显示 completed!（绿色），光标位置不变。"""
+        sys.stdout.write(f"\0337\033[u\033[K\033[92mcompleted!\033[0m\0338")
         sys.stdout.flush()
 
 
@@ -109,7 +117,7 @@ class TUI:
 
         while self._running:
             try:
-                user_input = await asyncio.to_thread(input, "")
+                user_input = await self._get_input()
             except EOFError:
                 self._console.print()
                 break
@@ -127,6 +135,18 @@ class TUI:
             await self._handle_chat(user_input)
 
         self._console.print("[dim]Goodbye![/]")
+
+    # ── 输入区域 ──────────────────────────────────────
+
+    async def _get_input(self) -> str:
+        """绘制输入提示符，获取用户输入。
+
+        使用分隔线 + 彩色提示符，避免 Panel 包裹导致长文本换行溢出。
+        """
+        self._console.print(Rule(style="dim cyan"))
+        self._console.print("[bold cyan]▸[/] ", end="")
+        sys.stdout.flush()
+        return await asyncio.to_thread(input, "")
 
     # ── 欢迎界面 ──────────────────────────────────────
 
@@ -152,28 +172,25 @@ class TUI:
     async def _handle_chat(self, user_input: str) -> None:
         """发送用户消息并流式显示 AI 回复。"""
 
-        # ── 替换输入行为带背景的 Panel（消除重复显示）──
-        user_panel = Panel(
-            Text(user_input),
-            box=box.ROUNDED,
-            border_style="bright_black",
-            style="on grey15",
-            padding=(0, 1),
-        )
-        # 光标上移一行，用 Panel 覆盖掉纯文本输入行
-        sys.stdout.write("\033[1A\033[2K")
+        # 清掉输入区域（2行：分隔线 + 提示符行），显示用户消息
+        sys.stdout.write("\033[2A\033[J")
         sys.stdout.flush()
-        self._console.print(user_panel)
+        self._console.print(f"[bold bright_black]▸[/] [bright_black]{user_input}[/]")
 
-        # ── 状态指示器 ──
+        # ── 状态行（复用 user message 下方的空行，避免 raw \n 与 Rich 冲突）──
+        self._console.print()  # 空行 = 状态行
+        # 保存状态行位置：上移一行 → 保存 → 下移返回
+        sys.stdout.write("\033[1A\033[s\033[1B")
+        sys.stdout.flush()
         indicator = StatusIndicator()
+
+        # ── 状态：thinking... 动画 ──
         thinking_task = asyncio.create_task(indicator.thinking())
 
         stream = self._chat.send(user_input)
         first_token = None
 
         try:
-            # 等待第一个 token
             first_token = await stream.__anext__()
         except StopAsyncIteration:
             first_token = None
@@ -187,17 +204,19 @@ class TUI:
             self._console.print("\n[yellow]已中断[/]")
             self._console.print(Rule(style="dim grey30"))
             self._console.print()
+            sys.stdout.flush()
             return
 
-        # 收到第一个 token，切换为 output 状态
+        # ── 切换到 output... 静态状态（安全，不与流式输出冲突）──
         indicator.stop()
         try:
             await thinking_task
         except asyncio.CancelledError:
             pass
 
-        self._console.print()
         indicator.show_output()
+
+        # ── AI 内容在 output... 下方的独立行输出 ──
         self._console.print("[bold cyan]│[/] ", end="")
 
         try:
@@ -210,18 +229,20 @@ class TUI:
             self._console.print("\n[yellow]已中断当前回复[/]")
             self._console.print(Rule(style="dim grey30"))
             self._console.print()
+            sys.stdout.flush()
             return
         except ProviderError as e:
             self._console.print(f"\n[red]API 错误: {e}[/]")
             self._console.print(Rule(style="dim grey30"))
             self._console.print()
+            sys.stdout.flush()
             return
 
-        # 完成
+        # ── 完成 ──
         indicator.show_completed()
-        self._console.print()
         self._console.print(Rule(style="dim grey30"))
         self._console.print()
+        sys.stdout.flush()
 
     # ── 命令处理 ──────────────────────────────────────
 
