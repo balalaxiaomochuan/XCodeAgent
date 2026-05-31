@@ -13,6 +13,7 @@ from xcodeagent.provider.base import (
     ChatDelta,
     ProviderError,
     TextDelta,
+    ThinkingDelta,
     ToolCall,
 )
 
@@ -106,6 +107,8 @@ class AnthropicProvider(BaseLLMProvider):
 
                         if delta.type == "text_delta":
                             yield TextDelta(text=delta.text)
+                        elif delta.type == "thinking_delta":
+                            yield ThinkingDelta(text=delta.thinking)
                         elif delta.type == "input_json_delta":
                             block["json_fragments"].append(delta.partial_json)
 

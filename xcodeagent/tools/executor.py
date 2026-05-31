@@ -1,4 +1,4 @@
-"""工具执行引擎：超时控制 + 统一错误处理。"""
+"""工具执行引擎：超时控制 + 统一错误处理 + 分批并发执行。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import time
 
 from xcodeagent.tools.base import ToolResult
 from xcodeagent.tools.registry import ToolRegistry
+from xcodeagent.provider.base import ToolCall
 
 
 class ToolExecutor:
@@ -68,3 +69,59 @@ class ToolExecutor:
 
         result.execution_time = time.perf_counter() - start
         return result
+
+    # ── 分批执行（ReAct Agent 用）───────────────────────────
+
+    async def execute_batch(
+        self,
+        tool_calls: list[ToolCall],
+    ) -> dict[str, ToolResult]:
+        """按 category 分批执行工具：读工具并发、写工具串行。
+
+        部分失败不影响其他工具，所有结果（成功或失败）都返回。
+
+        Args:
+            tool_calls: 模型返回的工具调用列表。
+
+        Returns:
+            {tool_use_id: ToolResult} 字典，确保每个 tool_use_id 都有结果。
+        """
+        # 按 category 分组（保留原始顺序）
+        reads: list[ToolCall] = []
+        writes: list[ToolCall] = []
+        for tc in tool_calls:
+            try:
+                tool = self._registry.get(tc.name)
+            except KeyError:
+                reads.append(tc)  # 未知工具当读处理，不会抛异常
+                continue
+            if tool.category == "write":
+                writes.append(tc)
+            else:
+                reads.append(tc)
+
+        all_results: dict[str, ToolResult] = {}
+
+        # 读工具并发执行
+        if reads:
+            results = await asyncio.gather(*[
+                self._execute_safe(tc) for tc in reads
+            ])
+            for tc, result in zip(reads, results):
+                all_results[tc.id] = result
+
+        # 写工具串行执行
+        for tc in writes:
+            all_results[tc.id] = await self._execute_safe(tc)
+
+        return all_results
+
+    async def _execute_safe(self, tool_call: ToolCall) -> ToolResult:
+        """执行单个工具调用，异常包装为 ToolResult（绝不抛异常）。"""
+        try:
+            return await self.call(tool_call.name, tool_call.input)
+        except Exception as e:
+            return ToolResult(
+                success=False,
+                error=f"{type(e).__name__}: {e}",
+            )

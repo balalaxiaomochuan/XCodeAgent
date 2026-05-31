@@ -20,6 +20,7 @@ class EditFile(BaseTool):
     """
 
     name = "edit_file"
+    category = "write"
     description = (
         "对同一文件执行多段精确文本替换，任一 old_string 匹配失败则整体回滚，文件原样不变。"
         "何时使用：修改代码片段、重构变量名、修复 bug、调整函数签名等局部修改。"

@@ -16,6 +16,7 @@ class WriteFile(BaseTool):
     """
 
     name = "write_file"
+    category = "write"
     description = (
         "创建新文件或完整覆盖已有文件。写入的是文件完整内容，不是追加。"
         "何时使用：创建新文件（如 __init__.py、新模块）；需要整体替换文件内容时。"

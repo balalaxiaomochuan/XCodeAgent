@@ -7,7 +7,7 @@ from typing import AsyncIterator, Optional
 from xcodeagent.tools.base import ToolResult
 from xcodeagent.tools.executor import ToolExecutor
 from xcodeagent.tools.registry import ToolRegistry
-from xcodeagent.provider.base import BaseLLMProvider, TextDelta, ToolCall
+from xcodeagent.provider.base import BaseLLMProvider, TextDelta, ThinkingDelta, ToolCall
 
 
 class ChatSession:
@@ -32,6 +32,16 @@ class ChatSession:
     def messages(self) -> list[dict]:
         """返回当前消息历史（只读引用）。"""
         return self._messages
+
+    @property
+    def provider(self) -> BaseLLMProvider:
+        """当前使用的 LLM Provider。"""
+        return self._provider
+
+    @property
+    def model(self) -> str:
+        """当前使用的模型 ID。"""
+        return self._model
 
     def clear(self) -> None:
         """清空对话历史，保留 system prompt（如果有的话）。"""

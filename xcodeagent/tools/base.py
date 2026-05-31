@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 
 @dataclass
@@ -28,6 +29,7 @@ class BaseTool(ABC):
 
     name: str = ""
     description: str = ""
+    category: Literal["read", "write"] = "read"
 
     def __init__(self, project_root: Path):
         self._project_root = project_root.resolve()

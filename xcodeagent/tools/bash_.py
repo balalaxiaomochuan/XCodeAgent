@@ -16,6 +16,7 @@ class Bash(BaseTool):
     """
 
     name = "bash"
+    category = "write"
     description = (
         "在项目根目录执行 shell 命令，返回 stdout、stderr 和退出码。"
         "何时使用：运行测试 (pytest)、安装依赖 (pip install)、git 操作 (git status/diff/log)、构建命令。"

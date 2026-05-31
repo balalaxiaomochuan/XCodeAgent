@@ -22,6 +22,12 @@ class TextDelta:
 
 
 @dataclass
+class ThinkingDelta:
+    """模型 extended thinking 过程的增量文本（仅 Anthropic）。"""
+    text: str
+
+
+@dataclass
 class ToolCall:
     """模型返回的工具调用（完整解析，非增量）。"""
     id: str
@@ -29,7 +35,7 @@ class ToolCall:
     input: dict
 
 
-ChatDelta = Union[TextDelta, ToolCall]
+ChatDelta = Union[TextDelta, ThinkingDelta, ToolCall]
 """chat_with_tools() 流式返回的 delta 类型。"""
 
 

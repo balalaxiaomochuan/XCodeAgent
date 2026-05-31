@@ -1,4 +1,4 @@
-"""XCodeAgent 入口：加载配置 → 创建 Provider → 创建工具 → 启动 TUI。"""
+"""XCodeAgent 入口：加载配置 → 创建 Provider → 创建工具 → 启动 Agent → TUI。"""
 
 from __future__ import annotations
 
@@ -8,11 +8,36 @@ import os
 import sys
 from pathlib import Path
 
+from xcodeagent.agent import Agent, AgentConfig
 from xcodeagent.chat import ChatSession
 from xcodeagent.config import ConfigError, create_default_config, load_config
 from xcodeagent.provider import create_provider
 from xcodeagent.tools import create_tool_executor
 from xcodeagent.tui import TUI
+
+
+# ── 系统提示词 ────────────────────────────────────────────────
+
+SYSTEM_PROMPT = """\
+你的名字是 XCodeAgent，一个命令行 AI 编程助手。
+
+## 核心能力
+- 你拥有六个工具：ReadFile（读文件）、WriteFile（写文件）、EditFile（编辑文件）、Bash（执行命令）、Glob（搜索文件）、Grep（搜索内容）。
+- 你可以自主推理——先读代码了解现状，再决定如何修改，最后执行并验证。
+
+## 行为准则
+- 收到任务后先思考：需要哪些信息？需要调用什么工具？按什么顺序？
+- 对于代码修改任务：先 ReadFile 了解当前代码，再 EditFile 精确修改，最后 Bash 验证。
+- 对于探索性任务：先用 Glob/Grep 定位目标文件，再 ReadFile 深入查看。
+- 工具结果出错时，尝试理解错误原因并调整策略，而不是简单放弃。
+- 修改完成后主动总结变更内容。
+
+## 交流风格
+- 回复简洁、准确、专业。
+- 用代码块展示代码片段。
+- 不确定时主动说明，不要编造。
+- 使用中文与用户交流。
+"""
 
 
 def _fix_windows_encoding() -> None:
@@ -37,7 +62,7 @@ def main():
     _fix_windows_encoding()
     parser = argparse.ArgumentParser(
         prog="xcodeagent",
-        description="命令行 AI 对话助手",
+        description="命令行 AI 编程助手 (ReAct Agent)",
     )
     parser.add_argument(
         "-c", "--config",
@@ -72,15 +97,21 @@ def main():
     project_root = Path(os.getcwd())
     tool_executor = create_tool_executor(project_root=project_root)
 
-    system_prompt = None
     chat_session = ChatSession(
         provider=provider,
         model=config.model,
-        system_prompt=system_prompt,
+        system_prompt=SYSTEM_PROMPT,
         extended_thinking=config.extended_thinking,
     )
 
-    tui = TUI(chat_session, config, tool_executor)
+    agent_config = AgentConfig(
+        max_rounds=20,
+        plan_only=False,
+        tool_timeout=120.0,
+    )
+    agent = Agent(chat_session, tool_executor, agent_config)
+
+    tui = TUI(agent, chat_session, config)
 
     try:
         asyncio.run(tui.run())
