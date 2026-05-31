@@ -1,15 +1,17 @@
-"""XCodeAgent 入口：加载配置 → 创建 Provider → 启动 TUI。"""
+"""XCodeAgent 入口：加载配置 → 创建 Provider → 创建工具 → 启动 TUI。"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
 from xcodeagent.chat import ChatSession
 from xcodeagent.config import ConfigError, create_default_config, load_config
 from xcodeagent.provider import create_provider
+from xcodeagent.tools import create_tool_executor
 from xcodeagent.tui import TUI
 
 
@@ -67,6 +69,9 @@ def main():
 
     provider = create_provider(config)
 
+    project_root = Path(os.getcwd())
+    tool_executor = create_tool_executor(project_root=project_root)
+
     system_prompt = None
     chat_session = ChatSession(
         provider=provider,
@@ -75,7 +80,7 @@ def main():
         extended_thinking=config.extended_thinking,
     )
 
-    tui = TUI(chat_session, config)
+    tui = TUI(chat_session, config, tool_executor)
 
     try:
         asyncio.run(tui.run())

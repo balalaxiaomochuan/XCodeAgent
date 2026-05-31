@@ -1,4 +1,4 @@
-"""终端交互界面（TUI）：基于 Rich 的流式对话 UI。"""
+"""终端交互界面（TUI）：基于 Rich 的流式对话 UI，支持工具调用展示。"""
 
 from __future__ import annotations
 
@@ -12,7 +12,10 @@ from rich.text import Text
 
 from xcodeagent.chat import ChatSession
 from xcodeagent.config import AppConfig
-from xcodeagent.provider.base import ProviderError
+from xcodeagent.tools.base import ToolResult
+from xcodeagent.tools.executor import ToolExecutor
+from xcodeagent.tools.registry import ToolRegistry
+from xcodeagent.provider.base import ProviderError, ToolCall
 
 
 def _render_logo() -> str:
@@ -21,30 +24,24 @@ def _render_logo() -> str:
 
 
 def _print_logo() -> None:
-    """用 ANSI 光标叠加打印带右下角阴影的 3D 立体 Logo。
-
-    先打偏移暗色阴影 → 光标回退 → 覆盖亮色前景。
-    前景的空格位会透出下方阴影，形成立体感。
-    """
+    """用 ANSI 光标叠加打印带右下角阴影的 3D 立体 Logo。"""
     logo = _render_logo()
     lines = logo.split("\n")
 
-    # 去掉末尾空行
     while lines and not lines[-1].strip():
         lines.pop()
 
     n = len(lines)
 
-    # ── 阴影层：暗灰色，向右下偏移 1 行 1 列 ──
-    sys.stdout.write("\n")  # 垂直偏移
+    # 阴影层
+    sys.stdout.write("\n")
     for line in lines:
         sys.stdout.write(f"\033[2m\033[90m {line}\033[0m\n")
 
-    # 回退光标
     sys.stdout.write(f"\033[{n + 1}A")
     sys.stdout.flush()
 
-    # ── 前景层：亮青色粗体 ──
+    # 前景层
     sys.stdout.write("\n")
     for line in lines:
         sys.stdout.write(f"\033[1m\033[96m{line}\033[0m\n")
@@ -55,18 +52,10 @@ def _print_logo() -> None:
 # ── 状态指示器 ────────────────────────────────────────────
 
 class StatusIndicator:
-    """在终端独立行内显示状态文字。
-
-    三个状态：
-      thinking...  → 灰色，省略号动画循环（1→2→3→1）
-      output...    → 黄色，静态（与流式内容并发安全）
-      completed!   → 绿色，静态
-    """
+    """在终端独立行内显示状态文字。"""
 
     def __init__(self):
         self._active = False
-
-    # ── thinking 动画（仅在无其他输出时运行，安全）─────
 
     async def thinking(self) -> None:
         """循环动画：thinking. → thinking.. → thinking..."""
@@ -84,18 +73,13 @@ class StatusIndicator:
             await asyncio.sleep(0.4)
 
     def stop(self) -> None:
-        """停止 thinking 动画。"""
         self._active = False
 
-    # ── output / completed 静态（与流式内容安全共存）───
-
     def show_output(self) -> None:
-        """在状态行显示 output...（静态，不循环动画）。"""
         sys.stdout.write(f"\033[u\033[K\033[93moutput...\033[0m\n")
         sys.stdout.flush()
 
     def show_completed(self) -> None:
-        """在状态行显示 completed!（绿色），光标位置不变。"""
         sys.stdout.write(f"\0337\033[u\033[K\033[92mcompleted!\033[0m\0338")
         sys.stdout.flush()
 
@@ -105,9 +89,10 @@ class StatusIndicator:
 class TUI:
     """基于 Rich 的交互式终端对话界面。"""
 
-    def __init__(self, chat_session: ChatSession, config: AppConfig):
+    def __init__(self, chat_session: ChatSession, config: AppConfig, tool_executor: ToolExecutor):
         self._chat = chat_session
         self._config = config
+        self._tool_executor = tool_executor
         self._console = Console()
         self._running = True
 
@@ -139,10 +124,6 @@ class TUI:
     # ── 输入区域 ──────────────────────────────────────
 
     async def _get_input(self) -> str:
-        """绘制输入提示符，获取用户输入。
-
-        使用分隔线 + 彩色提示符，避免 Panel 包裹导致长文本换行溢出。
-        """
         self._console.print(Rule(style="dim cyan"))
         self._console.print("[bold cyan]▸[/] ", end="")
         sys.stdout.flush()
@@ -151,11 +132,10 @@ class TUI:
     # ── 欢迎界面 ──────────────────────────────────────
 
     def _print_welcome(self) -> None:
-        """打印 3D logo 和基础信息。"""
         _print_logo()
 
         info = Text()
-        info.append("v0.1.0", style="dim")
+        info.append("v0.2.0", style="dim")
         info.append("  |  ", style="dim")
         info.append(self._config.model, style="cyan italic")
         info.append("  |  ", style="dim")
@@ -167,33 +147,33 @@ class TUI:
             "[dim]直接输入消息开始对话  |  /help 查看命令  |  /exit 退出[/]\n"
         )
 
-    # ── 聊天 ──────────────────────────────────────────
+    # ── 聊天（含工具调用）──────────────────────────────
 
     async def _handle_chat(self, user_input: str) -> None:
-        """发送用户消息并流式显示 AI 回复。"""
+        """发送用户消息并流式显示 AI 回复（支持工具调用）。"""
 
-        # 清掉输入区域（2行：分隔线 + 提示符行），显示用户消息
+        # 清掉输入区域，显示用户消息
         sys.stdout.write("\033[2A\033[J")
         sys.stdout.flush()
         self._console.print(f"[bold bright_black]▸[/] [bright_black]{user_input}[/]")
 
-        # ── 状态行（复用 user message 下方的空行，避免 raw \n 与 Rich 冲突）──
-        self._console.print()  # 空行 = 状态行
-        # 保存状态行位置：上移一行 → 保存 → 下移返回
+        # 状态行
+        self._console.print()
         sys.stdout.write("\033[1A\033[s\033[1B")
         sys.stdout.flush()
         indicator = StatusIndicator()
 
-        # ── 状态：thinking... 动画 ──
+        # thinking 动画
         thinking_task = asyncio.create_task(indicator.thinking())
 
-        stream = self._chat.send(user_input)
-        first_token = None
+        tool_registry = self._tool_executor.registry
+        stream = self._chat.send_with_tools(user_input, self._tool_executor, tool_registry)
+        first_item = None
 
         try:
-            first_token = await stream.__anext__()
+            first_item = await stream.__anext__()
         except StopAsyncIteration:
-            first_token = None
+            first_item = None
         except (KeyboardInterrupt, ProviderError):
             indicator.stop()
             thinking_task.cancel()
@@ -207,7 +187,7 @@ class TUI:
             sys.stdout.flush()
             return
 
-        # ── 切换到 output... 静态状态（安全，不与流式输出冲突）──
+        # 切换到 output 状态
         indicator.stop()
         try:
             await thinking_task
@@ -216,15 +196,22 @@ class TUI:
 
         indicator.show_output()
 
-        # ── AI 内容在 output... 下方的独立行输出 ──
+        # ── 处理流式事件 ──
         self._console.print("[bold cyan]│[/] ", end="")
 
+        tool_calls_seen = False
+
         try:
-            if first_token:
-                self._console.print(first_token, end="")
-            async for token in stream:
-                self._console.print(token, end="")
-            self._console.print()
+            # 先处理第一个 item
+            await self._process_stream_item(first_item, tool_calls_seen)
+            if isinstance(first_item, ToolCall):
+                tool_calls_seen = True
+
+            async for item in stream:
+                await self._process_stream_item(item, tool_calls_seen)
+                if isinstance(item, ToolCall):
+                    tool_calls_seen = True
+
         except KeyboardInterrupt:
             self._console.print("\n[yellow]已中断当前回复[/]")
             self._console.print(Rule(style="dim grey30"))
@@ -238,11 +225,39 @@ class TUI:
             sys.stdout.flush()
             return
 
-        # ── 完成 ──
+        self._console.print()
         indicator.show_completed()
         self._console.print(Rule(style="dim grey30"))
         self._console.print()
         sys.stdout.flush()
+
+    async def _process_stream_item(self, item, tool_calls_seen: bool) -> None:
+        """处理流中的一个 item：文本 token / ToolCall / ToolResult。"""
+        if isinstance(item, str):
+            self._console.print(item, end="")
+        elif isinstance(item, ToolCall):
+            # 换行后再显示工具调用状态，与流式文本分行
+            if tool_calls_seen:
+                self._console.print()
+            input_preview = ", ".join(f"{k}={v}" for k, v in item.input.items())
+            if len(input_preview) > 60:
+                input_preview = input_preview[:57] + "..."
+            self._console.print(
+                f"\n[bold cyan]  ⚡ calling {item.name}[/] [dim]({input_preview})[/]"
+            )
+        elif isinstance(item, ToolResult):
+            if item.success:
+                # 取输出第一行作为摘要
+                first_line = item.output.split("\n")[0] if item.output else "(empty)"
+                if len(first_line) > 80:
+                    first_line = first_line[:77] + "..."
+                self._console.print(
+                    f"[bold green]  ✅ {first_line}[/]"
+                )
+            else:
+                self._console.print(
+                    f"[bold red]  ❌ {item.error}[/]"
+                )
 
     # ── 命令处理 ──────────────────────────────────────
 
@@ -261,6 +276,9 @@ class TUI:
             self._console.print("  /exit, /quit    退出程序")
             self._console.print("  /clear          清空对话历史")
             self._console.print("  /help           显示本帮助")
+            self._console.print()
+            self._console.print("工具调用：", style="bold")
+            self._console.print("  在提问中描述任务，AI 会自动调用工具（读取文件、搜索、执行命令等）。")
             self._console.print()
         else:
             self._console.print(f"[red]未知命令: {user_input}[/]")
