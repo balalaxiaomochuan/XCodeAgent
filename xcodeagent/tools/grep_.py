@@ -1,3 +1,4 @@
+
 """Grep 工具：用正则表达式搜索文件内容，返回所有匹配行及其位置。"""
 
 from __future__ import annotations

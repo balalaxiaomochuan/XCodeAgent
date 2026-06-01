@@ -58,43 +58,6 @@ def _print_logo() -> None:
     sys.stdout.flush()
 
 
-# ── 转轮动画帧 ────────────────────────────────────────────────
-
-_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
-
-class WorkingSpinner:
-    """统一的工作状态指示器：小转轮 + 'working...'。
-
-    在后台协程中循环刷新终端上的同一行，不干扰正文输出。
-    通过 \\0337/\\0338 保护正向光标位置，确保 Rich 内部的
-    光标追踪不受干扰。
-    """
-
-    def __init__(self):
-        self._active = False
-
-    async def run(self) -> None:
-        """启动转轮动画（阻塞直到 stop() 被调用）。"""
-        self._active = True
-        i = 0
-        while self._active:
-            frame = _SPINNER_FRAMES[i % len(_SPINNER_FRAMES)]
-            # \\0337 保存当前正向光标 → \\033[u 回 spinner 行 → 写入 → \\0338 恢复
-            sys.stdout.write(
-                f"\0337\033[u\033[K  \033[90m{frame} working...\033[0m\0338"
-            )
-            sys.stdout.flush()
-            i += 1
-            await asyncio.sleep(0.1)
-
-    def stop(self) -> None:
-        """停止转轮并清除状态行。"""
-        self._active = False
-        sys.stdout.write("\0337\033[u\033[K\0338")
-        sys.stdout.flush()
-
-
 # ── Esc 键监听器 ──────────────────────────────────────────────
 
 
@@ -146,9 +109,8 @@ class TUI:
         self._config = config
         self._console = Console()
         self._running = True
-        self._spinner: WorkingSpinner | None = None
-        self._spinner_task: asyncio.Task | None = None
-        self._first_text = True  # 是否本轮第一个 TextDelta
+        self._first_text = True   # 是否本轮第一个 TextDelta
+        self._in_thinking = False  # 是否正在渲染 thinking 内容
 
     async def run(self) -> None:
         """启动 TUI 主循环。"""
@@ -213,22 +175,16 @@ class TUI:
         sys.stdout.write("\033[2A\033[J")
         sys.stdout.flush()
         self._console.print(f"[bold bright_black]▸[/] [bright_black]{user_input}[/]")
-
-        # 保存光标位置作为 spinner 行，然后下移一行留给正文
-        sys.stdout.write("\033[s")  # 当前行 = spinner 行
-        self._console.print()      # 下移，正文区域
-        sys.stdout.flush()
+        self._console.print()
 
         self._first_text = True
-
-        # 启动转轮
-        self._spinner = WorkingSpinner()
-        self._spinner_task = asyncio.create_task(self._spinner.run())
+        self._turn_has_output = False  # 当前轮是否有过文本或工具输出
 
         cancel_token = asyncio.Event()
         esc_task = asyncio.create_task(_listen_for_esc(cancel_token))
 
         try:
+            self._console.print("[dim]  thinking...[/]")
             async for event in self._agent.run(user_input, cancel_token):
                 self._dispatch(event)
         except KeyboardInterrupt:
@@ -239,7 +195,6 @@ class TUI:
         except Exception as e:
             self._console.print(f"\n[red]Agent 错误: {e}[/]")
         finally:
-            self._stop_spinner()
             esc_task.cancel()
             try:
                 await esc_task
@@ -256,32 +211,46 @@ class TUI:
         if isinstance(event, UserMessage):
             pass  # 已在 _handle_chat 中渲染
         elif isinstance(event, ThinkingDelta):
+            if not self._config.show_thinking:
+                return  # 配置关闭思考展示
+            self._turn_has_output = True
             self._render_thinking(event.text)
         elif isinstance(event, TextDelta):
+            self._end_thinking()  # 结束 thinking 行，切换到文本模式
+            self._turn_has_output = True
             self._render_text(event.text)
         elif isinstance(event, ToolCallStart):
-            self._stop_spinner()
+            self._end_thinking()
+            self._turn_has_output = True
             self._render_tool_start(event.tool_name, event.tool_input)
         elif isinstance(event, ToolCallEnd):
             self._render_tool_end(event.tool_name, event.success, event.output, event.error)
-            # 工具结果回来后重新启动 spinner（等待下一轮 LLM 响应）
-            self._start_spinner()
+            self._first_text = True
         elif isinstance(event, TurnEnd):
-            self._stop_spinner()
+            self._end_thinking()
             if event.reason == "cancelled":
                 self._console.print("\n[yellow][已取消][/]")
             elif event.reason == "max_rounds":
                 self._console.print(f"\n[yellow][已达最大轮数 {event.round_number}][/]")
+            elif event.reason == "continue":
+                self._console.print("[dim]  thinking...[/]")
         elif isinstance(event, AgentError):
             self._console.print(f"\n[red]⚠ {event.message}[/]")
 
     # ── 事件渲染方法 ──────────────────────────────────────
 
+    def _end_thinking(self) -> None:
+        """结束 thinking 模式，换行以便后续内容另起一行。"""
+        if self._in_thinking:
+            self._console.print()  # 结束 thinking 行
+            self._in_thinking = False
+
     def _render_thinking(self, text: str) -> None:
         """thinking 增量：灰色文字流式追加。"""
-        if self._first_text:
-            self._first_text = False
-            self._console.print("[bold cyan]│[/] ", end="")
+        if not self._in_thinking:
+            self._console.print()  # 另起一行
+            self._console.print("[dim]💭 ", end="")
+            self._in_thinking = True
         self._console.print(text, end="", style="dim")
 
     def _render_text(self, text: str) -> None:
@@ -312,25 +281,6 @@ class TUI:
             if len(err) > 80:
                 err = err[:77] + "..."
             self._console.print(f"[bold red]  ❌ {err}[/]")
-        self._first_text = True
-
-    # ── Spinner 控制 ──────────────────────────────────────
-
-    def _start_spinner(self) -> None:
-        """（重新）启动转轮动画。"""
-        if self._spinner_task and not self._spinner_task.done():
-            return
-        self._spinner = WorkingSpinner()
-        self._spinner_task = asyncio.create_task(self._spinner.run())
-
-    def _stop_spinner(self) -> None:
-        """停止转轮并清除状态行。"""
-        if self._spinner:
-            self._spinner.stop()
-            self._spinner = None
-        if self._spinner_task and not self._spinner_task.done():
-            self._spinner_task.cancel()
-            self._spinner_task = None
 
     # ── 命令处理 ──────────────────────────────────────────
 
@@ -350,6 +300,8 @@ class TUI:
             self._console.print("  /clear            清空对话历史")
             self._console.print("  /plan-on          进入计划模式（只读，不执行写操作）")
             self._console.print("  /plan-off         退出计划模式")
+            self._console.print("  /thinking-on      展示模型思考过程")
+            self._console.print("  /thinking-off     隐藏模型思考过程")
             self._console.print("  /help             显示本帮助")
             self._console.print()
             self._console.print("快捷键：", style="bold")
@@ -365,6 +317,14 @@ class TUI:
         elif cmd == "/plan-off":
             self._agent._config.plan_only = False
             self._console.print("[green]已退出 Plan-only 模式，所有工具恢复正常执行。[/]")
+            self._console.print()
+        elif cmd == "/thinking-on":
+            self._config.show_thinking = True
+            self._console.print("[green]已开启思考过程展示。[/]")
+            self._console.print()
+        elif cmd == "/thinking-off":
+            self._config.show_thinking = False
+            self._console.print("[yellow]已关闭思考过程展示。[/]")
             self._console.print()
         else:
             self._console.print(f"[red]未知命令: {user_input}[/]")

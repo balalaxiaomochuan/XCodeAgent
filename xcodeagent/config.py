@@ -28,13 +28,44 @@ class AppConfig:
     base_url: str
     api_key: str
     extended_thinking: Optional[ExtendedThinkingConfig] = None
+    show_thinking: bool = True  # 是否在 UI 中展示思考内容
+
+
+def _default_config_path() -> Path:
+    """全局默认配置路径：~/.xcodeagent/config.json"""
+    return Path.home() / ".xcodeagent" / "config.json"
+
+
+def _resolve_config_path(path: str | Path) -> Path:
+    """解析配置文件路径，支持多级查找。
+
+    查找顺序：
+    1. 用户显式指定的路径（-c 参数）
+    2. 当前目录下的 config.json
+    3. 全局 ~/.xcodeagent/config.json
+    """
+    path = Path(path)
+    # 如果用户显式指定了路径（不是默认值），直接返回
+    if path != Path("config.json"):
+        return path
+    # 当前目录有 config.json 则优先使用
+    if path.exists():
+        return path
+    # 回退到全局配置
+    global_path = _default_config_path()
+    if global_path.exists():
+        return global_path
+    # 都不存在则返回当前目录路径，让后续逻辑报清晰的错误
+    return path
 
 
 def load_config(path: str | Path) -> AppConfig:
     """从 JSON 文件加载配置。
 
+    查找顺序：显式路径 → ./config.json → ~/.xcodeagent/config.json
+
     Args:
-        path: 配置文件路径。
+        path: 配置文件路径（默认 "config.json"）。
 
     Returns:
         AppConfig 实例。
@@ -42,10 +73,13 @@ def load_config(path: str | Path) -> AppConfig:
     Raises:
         ConfigError: 配置缺失、格式错误或文件不存在。
     """
-    path = Path(path)
+    path = _resolve_config_path(path)
 
     if not path.exists():
-        raise ConfigError(f"配置文件不存在: {path}")
+        raise ConfigError(
+            f"配置文件不存在: {path}\n"
+            f"请运行 xcodeagent --init 生成配置模板"
+        )
 
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -80,6 +114,7 @@ def load_config(path: str | Path) -> AppConfig:
         base_url=data["base_url"],
         api_key=data["api_key"],
         extended_thinking=ext_thinking,
+        show_thinking=data.get("show_thinking", True),
     )
 
 
@@ -90,11 +125,13 @@ def create_default_config(path: str | Path) -> None:
         "model": "claude-sonnet-4-6",
         "base_url": "https://api.anthropic.com",
         "api_key": "sk-ant-xxxxxxxxxxxx",
+        "show_thinking": True,
         "extended_thinking": {
             "enabled": False,
             "budget_tokens": 4000,
         },
     }
     path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(template, f, indent=2, ensure_ascii=False)

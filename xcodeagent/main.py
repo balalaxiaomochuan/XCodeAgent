@@ -10,7 +10,7 @@ from pathlib import Path
 
 from xcodeagent.agent import Agent, AgentConfig
 from xcodeagent.chat import ChatSession
-from xcodeagent.config import ConfigError, create_default_config, load_config
+from xcodeagent.config import ConfigError, _default_config_path, create_default_config, load_config
 from xcodeagent.provider import create_provider
 from xcodeagent.tools import create_tool_executor
 from xcodeagent.tui import TUI
@@ -19,7 +19,7 @@ from xcodeagent.tui import TUI
 # ── 系统提示词 ────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """\
-你的名字是 XCodeAgent，一个命令行 AI 编程助手。
+你的名字是 XCodeAgent，一个由蟑螂恶霸开发的命令行 AI 编程助手。
 
 ## 核心能力
 - 你拥有六个工具：ReadFile（读文件）、WriteFile（写文件）、EditFile（编辑文件）、Bash（执行命令）、Glob（搜索文件）、Grep（搜索内容）。
@@ -37,6 +37,7 @@ SYSTEM_PROMPT = """\
 - 用代码块展示代码片段。
 - 不确定时主动说明，不要编造。
 - 使用中文与用户交流。
+- 打印在终端的内容不能使用markdown格式
 """
 
 
@@ -74,16 +75,23 @@ def main():
         action="store_true",
         help="在当前目录生成配置文件模板 config.json",
     )
+    parser.add_argument(
+        "-g", "--global",
+        action="store_true",
+        dest="global_init",
+        help="与 --init 配合使用，将配置生成到 ~/.xcodeagent/config.json（全局）",
+    )
     args = parser.parse_args()
 
     if args.init:
-        if Path("config.json").exists():
-            print("config.json 已存在，覆盖吗？[y/N] ", end="")
+        config_path = _default_config_path() if args.global_init else Path("config.json")
+        if config_path.exists():
+            print(f"{config_path} 已存在，覆盖吗？[y/N] ", end="")
             if input().strip().lower() != "y":
                 print("已取消。")
                 return
-        create_default_config("config.json")
-        print("已生成 config.json，请编辑填入 API Key 后启动。")
+        create_default_config(config_path)
+        print(f"已生成 {config_path}，请编辑填入 API Key 后启动。")
         return
 
     try:
