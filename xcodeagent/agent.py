@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from dataclasses import dataclass, field
 from typing import AsyncIterator
 
@@ -11,6 +12,8 @@ from xcodeagent.events import (
     AgentError,
     AgentEvent,
     FinalReply,
+    PermissionRequest,
+    PermissionResponse,
     TextDelta,
     ThinkingDelta,
     ToolCallEnd,
@@ -19,6 +22,7 @@ from xcodeagent.events import (
     TurnStart,
     UserMessage,
 )
+from xcodeagent.permission import PermissionManager, PermissionConfig
 from xcodeagent.provider.base import TextDelta as ProviderTextDelta
 from xcodeagent.provider.base import ThinkingDelta as ProviderThinkingDelta
 from xcodeagent.provider.base import ToolCall as ProviderToolCall
@@ -52,10 +56,19 @@ class Agent:
         chat_session: ChatSession,
         tool_executor: ToolExecutor,
         config: AgentConfig | None = None,
+        permission_manager: PermissionManager | None = None,
     ):
         self._chat = chat_session
         self._executor = tool_executor
         self._config = config or AgentConfig()
+        self._permission = permission_manager
+
+        # Agent → TUI 的权限请求通道
+        self._perm_request_queue: asyncio.Queue[PermissionRequest] = asyncio.Queue()
+        # TUI → Agent 的权限响应通道
+        self.permission_response_queue: asyncio.Queue[PermissionResponse] = (
+            asyncio.Queue()
+        )
 
     # ── 主入口 ─────────────────────────────────────────────
 
@@ -75,6 +88,10 @@ class Agent:
         """
         yield UserMessage(content=user_input)
         self._chat.messages.append({"role": "user", "content": user_input})
+
+        # 新一轮开始，重置权限状态
+        if self._permission:
+            self._permission.reset_round()
 
         for round_num in range(1, self._config.max_rounds + 1):
             # ── 检查外部取消 ──
@@ -128,9 +145,26 @@ class Agent:
                 yield TurnEnd(round_number=round_num, reason="no_tools")
                 break
 
-            # ── 执行工具（分批：读并发、写串行）─��
-            all_results = await self._executor.execute_batch(tool_calls)
+            # ── 执行工具（分批：读并发、写串行）──
+            all_results: dict[str, ToolResult] = {}
 
+            # 按 category 分组
+            reads, writes = self._partition_tools(tool_calls)
+
+            # 读工具并发执行（读工具默认跳过权限检查）
+            if reads:
+                results = await asyncio.gather(*[
+                    self._executor._execute_safe(tc) for tc in reads
+                ])
+                for tc, result in zip(reads, results):
+                    all_results[tc.id] = result
+
+            # 写工具串行执行（每个经过权限检查）
+            for tc in writes:
+                result = await self._execute_write_tool(tc)
+                all_results[tc.id] = result
+
+            # 发出工具结果事件
             for tc in tool_calls:
                 result = all_results[tc.id]
                 yield ToolCallEnd(
@@ -165,7 +199,122 @@ class Agent:
             yield TurnEnd(round_number=self._config.max_rounds, reason="max_rounds")
             yield AgentError(message="达到最大循环轮数，Agent 已停止")
 
-    # ── Plan-only 工具拦截 ──────────────────────────────────
+    # ── 写工具执行（含权限检查）──────────────────────────────
+
+    async def _execute_write_tool(self, tool_call: ProviderToolCall) -> ToolResult:
+        """执行单个写工具，先经过权限检查。
+
+        权限检查流程:
+            1. plan_only 模式 → 直接拦截
+            2. 调用 PermissionManager.check()
+            3. ALLOW → 直接执行
+            4. BLOCK → 返回失败 ToolResult
+            5. ASK → 构造 PermissionRequest 并通过队列等待 TUI 响应
+
+        注意: 步骤 5 的 PermissionRequest 不是通过 yield 发送到事件流的，
+        而是通过一个独立的 asyncio.Queue。TUI 需要通过该队列获取请求并渲染对话框。
+        """
+        # ── plan_only 模式快捷拦截 ──
+        if self._config.plan_only:
+            try:
+                tool = self._executor.registry.get(tool_call.name)
+            except KeyError:
+                return ToolResult(success=False, error=f"未知工具: {tool_call.name}")
+
+            if tool.category == "write":
+                return ToolResult(
+                    success=False,
+                    error=(
+                        f"[Plan-only 模式] 写操作 '{tool_call.name}' 已拦截。"
+                        "如需执行，请运行 /plan-off 关闭计划模式。"
+                    ),
+                )
+
+        # ── 无权限管理器 → 直接执行 ──
+        if self._permission is None:
+            return await self._executor._execute_safe(tool_call)
+
+        # ── 权限检查 ──
+        perm_result = self._permission.check(tool_call.name, tool_call.input)
+
+        # ALLOW → 直接执行
+        if perm_result.is_allow:
+            return await self._executor._execute_safe(tool_call)
+
+        # BLOCK → 返回拦截结果
+        if perm_result.is_block:
+            return ToolResult(success=False, error=perm_result.reason)
+
+        # ASK → 等待用户确认
+        request_id = str(uuid.uuid4())
+        request = PermissionRequest(
+            request_id=request_id,
+            tool_call_id=tool_call.id,
+            tool_name=tool_call.name,
+            tool_input=tool_call.input,
+            risk_level=perm_result.risk_level,
+            source_layer=perm_result.source_layer,
+            source_description=perm_result.reason,
+            summary=perm_result.summary or self._make_summary(tool_call),
+        )
+
+        # 把 request 放入 TUI 可以读取的位置
+        # 同时把 request 通过外部队列发送给 TUI
+        self._last_permission_request = request
+        # TUI 通过 permission_response_queue 传回响应
+        # 但 TUI 需要先知道有 request...
+        # 方案: Agent 通过独立的事件通知机制告诉 TUI
+        # 实际做法: TUI 在 agent.run() 循环中同时监听
+        # Agent._last_permission_request 的变化
+
+        await self._perm_request_queue.put(request)
+
+        # 等待 TUI 响应
+        response = await self.permission_response_queue.get()
+
+        if response.decision == "deny":
+            return ToolResult(
+                success=False,
+                error="[用户拒绝] 操作已被用户拒绝。",
+            )
+        elif response.decision == "allow_all":
+            self._permission.allow_all_this_round()
+
+        # allow_once 或 allow_all → 执行
+        return await self._executor._execute_safe(tool_call)
+
+    @staticmethod
+    def _make_summary(tool_call: ProviderToolCall) -> str:
+        """生成工具调用的单行摘要。"""
+        name = tool_call.name
+        inp = tool_call.input
+        if name == "bash":
+            cmd = inp.get("command", "")
+            return f"{name}: {cmd[:60]}"
+        elif name in ("write_file", "edit_file", "read_file"):
+            fp = inp.get("file_path", "")
+            return f"{name}: {fp}"
+        elif name in ("glob", "grep"):
+            pat = inp.get("pattern", "")
+            return f"{name}: {pat}"
+        return f"{name}"
+
+    # ── 工具分组 ─────────────────────────────────────────────
+
+    @staticmethod
+    def _partition_tools(
+        tool_calls: list[ProviderToolCall],
+    ) -> tuple[list[ProviderToolCall], list[ProviderToolCall]]:
+        """按 category 分组工具调用。"""
+        reads, writes = [], []
+        for tc in tool_calls:
+            if tc.name in ("read_file", "glob", "grep"):
+                reads.append(tc)
+            else:
+                writes.append(tc)
+        return reads, writes
+
+    # ── Plan-only 工具拦截（保留 V4 兼容）───────────────────
 
     async def _execute_tool(self, tool_call: ProviderToolCall) -> ToolResult:
         """执行单个工具，plan-only 模式下拦截写操作。"""
@@ -183,4 +332,4 @@ class Agent:
                 ),
             )
 
-        return await self._executor.call(tool_call.name, tool_call.input)
+        return await self._executor._execute_safe(tool_call)

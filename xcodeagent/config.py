@@ -1,4 +1,4 @@
-"""配置模块：从 JSON 文件加载 LLM 供应商配置。"""
+"""配置模块：从 JSON 文件加载 LLM 供应商配置和权限配置。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from xcodeagent.permission import PermissionConfig
 
 
 class ConfigError(Exception):
@@ -28,7 +30,8 @@ class AppConfig:
     base_url: str
     api_key: str
     extended_thinking: Optional[ExtendedThinkingConfig] = None
-    show_thinking: bool = True  # 是否在 UI 中展示思考内容
+    show_thinking: bool = True
+    permissions: PermissionConfig = field(default_factory=PermissionConfig)
 
 
 def _default_config_path() -> Path:
@@ -45,18 +48,41 @@ def _resolve_config_path(path: str | Path) -> Path:
     3. 全局 ~/.xcodeagent/config.json
     """
     path = Path(path)
-    # 如果用户显式指定了路径（不是默认值），直接返回
     if path != Path("config.json"):
         return path
-    # 当前目录有 config.json 则优先使用
     if path.exists():
         return path
-    # 回退到全局配置
     global_path = _default_config_path()
     if global_path.exists():
         return global_path
-    # 都不存在则返回当前目录路径，让后续逻辑报清晰的错误
     return path
+
+
+def _load_permission_config(data: dict) -> PermissionConfig:
+    """从 JSON 数据中加载权限配置。"""
+    perm_data = data.get("permissions", {})
+    if not isinstance(perm_data, dict):
+        return PermissionConfig()
+
+    config = PermissionConfig(
+        mode=perm_data.get("mode", "default"),
+        confirm_timeout=float(perm_data.get("confirm_timeout", 0)),
+        rules=perm_data.get("rules", []),
+        prepend_rules=bool(perm_data.get("prepend_rules", False)),
+        dangerous_commands_extra=perm_data.get("dangerous_commands_extra", []),
+    )
+
+    errors = config.validate()
+    if errors:
+        # 不阻止启动，但打印警告
+        import sys
+        for err in errors:
+            print(f"[WARNING] 权限配置: {err}", file=sys.stderr)
+        # 对无效 mode 回退到 default
+        if config.mode not in ("default", "acceptEdits", "plan"):
+            config.mode = "default"
+
+    return config
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -108,6 +134,9 @@ def load_config(path: str | Path) -> AppConfig:
             budget_tokens=et.get("budget_tokens", 4000),
         )
 
+    # 解析权限配置
+    permissions = _load_permission_config(data)
+
     return AppConfig(
         protocol=protocol,
         model=data["model"],
@@ -115,6 +144,7 @@ def load_config(path: str | Path) -> AppConfig:
         api_key=data["api_key"],
         extended_thinking=ext_thinking,
         show_thinking=data.get("show_thinking", True),
+        permissions=permissions,
     )
 
 
@@ -129,6 +159,13 @@ def create_default_config(path: str | Path) -> None:
         "extended_thinking": {
             "enabled": False,
             "budget_tokens": 4000,
+        },
+        "permissions": {
+            "mode": "default",
+            "confirm_timeout": 0,
+            "rules": [],
+            "prepend_rules": False,
+            "dangerous_commands_extra": [],
         },
     }
     path = Path(path)

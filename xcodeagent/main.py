@@ -11,6 +11,7 @@ from pathlib import Path
 from xcodeagent.agent import Agent, AgentConfig
 from xcodeagent.chat import ChatSession
 from xcodeagent.config import ConfigError, _default_config_path, create_default_config, load_config
+from xcodeagent.permission import PermissionManager
 from xcodeagent.provider import create_provider
 from xcodeagent.tools import create_tool_executor
 from xcodeagent.tui import TUI
@@ -117,9 +118,15 @@ def main():
         plan_only=False,
         tool_timeout=120.0,
     )
-    agent = Agent(chat_session, tool_executor, agent_config)
 
-    tui = TUI(agent, chat_session, config)
+    permission_manager = PermissionManager(
+        project_root=project_root,
+        config=config.permissions,
+    )
+
+    agent = Agent(chat_session, tool_executor, agent_config, permission_manager)
+
+    tui = TUI(agent, chat_session, config, project_root=project_root)
 
     try:
         asyncio.run(tui.run())

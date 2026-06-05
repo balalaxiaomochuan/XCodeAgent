@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 
 import pyfiglet
 from rich.console import Console
+from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
@@ -16,6 +18,8 @@ from xcodeagent.config import AppConfig
 from xcodeagent.events import (
     AgentError,
     AgentEvent,
+    PermissionRequest,
+    PermissionResponse,
     TextDelta,
     ThinkingDelta,
     ToolCallEnd,
@@ -23,6 +27,9 @@ from xcodeagent.events import (
     TurnEnd,
     UserMessage,
 )
+from xcodeagent.command_analyzer import analyze_tool_call
+from xcodeagent.input_ui import InputUI
+from xcodeagent.permission import PermissionMode
 from xcodeagent.provider.base import ProviderError
 
 
@@ -103,14 +110,16 @@ class TUI:
         agent: Agent,
         chat_session: ChatSession,
         config: AppConfig,
+        project_root: Path | None = None,
     ):
         self._agent = agent
         self._chat = chat_session
         self._config = config
         self._console = Console()
         self._running = True
-        self._first_text = True   # 是否本轮第一个 TextDelta
-        self._in_thinking = False  # 是否正在渲染 thinking 内容
+        self._first_text = True
+        self._in_thinking = False
+        self._input_ui = InputUI(project_root=project_root or Path.cwd())
 
     async def run(self) -> None:
         """启动 TUI 主循环。"""
@@ -140,11 +149,29 @@ class TUI:
     # ── 输入区域 ──────────────────────────────────────────
 
     async def _get_input(self) -> str:
-        mode_label = "[yellow]PLAN-ONLY[/] " if self._agent._config.plan_only else ""
+        label = self._mode_label()
         self._console.print(Rule(style="dim cyan"))
-        self._console.print(f"{mode_label}[bold cyan]▸[/] ", end="")
+        self._console.print(f"{label}[bold cyan]▸[/] ", end="")
         sys.stdout.flush()
-        return await asyncio.to_thread(input, "")
+        return await self._input_ui.get_input()
+
+    def _mode_label(self) -> str:
+        """构建权限模式标签。"""
+        parts = []
+        if self._agent._config.plan_only:
+            parts.append("[yellow]PLAN-ONLY[/] ")
+        if self._agent._permission:
+            mode = self._agent._permission.mode
+            labels = {
+                PermissionMode.DEFAULT: "[dim][D][/] ",
+                PermissionMode.ACCEPT_EDITS: "[dim][A][/] ",
+                PermissionMode.PLAN: "[yellow][P][/] ",
+            }
+            label = labels.get(mode, "")
+            if self._agent._permission.is_allow_all_active:
+                label = label.replace("[/]", "*[/]")
+            parts.append(label)
+        return "".join(parts)
 
     # ── 欢迎界面 ──────────────────────────────────────────
 
@@ -152,7 +179,7 @@ class TUI:
         _print_logo()
 
         info = Text()
-        info.append("v0.3.0", style="dim")
+        info.append("v0.4.0", style="dim")
         info.append("  |  ", style="dim")
         info.append(self._config.model, style="cyan italic")
         info.append("  |  ", style="dim")
@@ -178,15 +205,56 @@ class TUI:
         self._console.print()
 
         self._first_text = True
-        self._turn_has_output = False  # 当前轮是否有过文本或工具输出
+        self._turn_has_output = False
 
         cancel_token = asyncio.Event()
         esc_task = asyncio.create_task(_listen_for_esc(cancel_token))
 
+        # 创建 Agent 事件消费任务
+        agent_events: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
+
+        async def collect_events():
+            try:
+                async for event in self._agent.run(user_input, cancel_token):
+                    await agent_events.put(event)
+            except Exception:
+                pass
+            finally:
+                await agent_events.put(None)  # 结束信号
+
+        collect_task = asyncio.create_task(collect_events())
+
         try:
             self._console.print("[dim]  thinking...[/]")
-            async for event in self._agent.run(user_input, cancel_token):
+
+            while True:
+                # 先检查权限请求（不阻塞）
+                req = self._try_get_perm_request()
+                if req is not None:
+                    response = await self._show_permission_dialog(req)
+                    await self._agent.permission_response_queue.put(response)
+                    continue
+
+                # 等待 Agent 事件（带超时，以便周期性检查权限请求）
+                try:
+                    event = await asyncio.wait_for(agent_events.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    # 检查结束条件
+                    if agent_events.empty() and collect_task.done():
+                        break
+                    continue
+
+                if event is None:
+                    break
                 self._dispatch(event)
+
+                # 事件流结束后检查是否还有未消费事件
+                if agent_events.empty() and collect_task.done():
+                    # 再检查一次权限队列
+                    req = self._try_get_perm_request()
+                    if req is None:
+                        break
+
         except KeyboardInterrupt:
             cancel_token.set()
             self._console.print("\n[yellow]已中断当前回复[/]")
@@ -196,27 +264,146 @@ class TUI:
             self._console.print(f"\n[red]Agent 错误: {e}[/]")
         finally:
             esc_task.cancel()
+            collect_task.cancel()
             try:
-                await esc_task
+                await asyncio.gather(esc_task, collect_task, return_exceptions=True)
             except asyncio.CancelledError:
                 pass
 
         self._console.print(Rule(style="dim grey30"))
         self._console.print()
 
+    def _try_get_perm_request(self) -> PermissionRequest | None:
+        """非阻塞方式获取 Agent 的权限请求。"""
+        if hasattr(self._agent, '_perm_request_queue'):
+            try:
+                return self._agent._perm_request_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+        return None
+
+    # ── 权限确认对话框 ──────────────────────────────────────
+
+    async def _show_permission_dialog(
+        self, request: PermissionRequest
+    ) -> PermissionResponse:
+        """渲染权限确认对话框并等待用户输入。
+
+        Returns:
+            PermissionResponse: 用户决策。
+        """
+        risk_colors = {
+            "low": "green",
+            "medium": "yellow",
+            "high": "red",
+            "critical": "bold red",
+        }
+        risk_color = risk_colors.get(request.risk_level, "yellow")
+
+        # 命令分析
+        analysis = analyze_tool_call(request.tool_name, request.tool_input)
+
+        # 提取关键参数摘要
+        param_lines = []
+        for k, v in request.tool_input.items():
+            s = str(v)
+            if len(s) > 100:
+                s = s[:97] + "..."
+            param_lines.append(f"  {k}: {s}")
+
+        body_parts = [
+            f"[bold]工具:[/] {request.tool_name}",
+            f"[bold]用途:[/] [bold cyan]{analysis.summary}[/]",
+            f"[bold]影响:[/] {analysis.impact}",
+        ]
+        if analysis.risk_hint:
+            body_parts.append(f"[bold]⚠ 注意:[/] [yellow]{analysis.risk_hint}[/]")
+        body_parts += [
+            "",
+            f"[bold]参数:[/]",
+            *param_lines,
+            "",
+            f"[bold]风险级别:[/] [{risk_color}]{request.risk_level.upper()}[/]",
+            f"[bold]触发来源:[/] {request.source_description}",
+        ]
+
+        panel = Panel(
+            "\n".join(body_parts),
+            title="[bold]⚠ 确认工具调用[/]",
+            border_style=risk_color,
+            padding=(1, 2),
+        )
+        self._console.print()
+        self._console.print(panel)
+        self._console.print()
+        self._console.print(
+            f" [{risk_color}][Y][/] 允许本次  "
+            f"[bold red][N][/] 拒绝  "
+            f"[bold yellow][A][/] 本轮全部允许"
+        )
+
+        # 读取用户输入（单字符）
+        while True:
+            ch = await self._read_single_key()
+            ch = ch.upper() if ch else ""
+            if ch in ("Y", "N", "A"):
+                break
+
+        decision_map = {"Y": "allow_once", "A": "allow_all", "N": "deny"}
+        decision = decision_map[ch]
+
+        # 显示决策结果
+        result_text = {
+            "allow_once": "[green]✓ 已允许本次执行[/]",
+            "allow_all": "[yellow]✓ 已允许本轮全部执行[/]",
+            "deny": "[red]✗ 已拒绝[/]",
+        }
+        self._console.print(result_text[decision])
+        self._console.print()
+
+        return PermissionResponse(
+            request_id=request.request_id,
+            tool_call_id=request.tool_call_id,
+            decision=decision,
+        )
+
+    async def _read_single_key(self) -> str:
+        """读取单个按键，跨平台兼容。"""
+        if sys.platform == "win32":
+            import msvcrt
+            while True:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getch()
+                    try:
+                        return ch.decode("utf-8")
+                    except UnicodeDecodeError:
+                        return "?"
+                await asyncio.sleep(0.05)
+        else:
+            import termios
+            import tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                ch = await asyncio.to_thread(sys.stdin.read, 1)
+                return ch
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
     # ── 事件分发 ──────────────────────────────────────────
 
     def _dispatch(self, event: AgentEvent) -> None:
         """匹配事件类型并分发到对应渲染方法。"""
         if isinstance(event, UserMessage):
-            pass  # 已在 _handle_chat 中渲染
+            pass
         elif isinstance(event, ThinkingDelta):
             if not self._config.show_thinking:
-                return  # 配置关闭思考展示
+                return
             self._turn_has_output = True
             self._render_thinking(event.text)
         elif isinstance(event, TextDelta):
-            self._end_thinking()  # 结束 thinking 行，切换到文本模式
+            self._end_thinking()
             self._turn_has_output = True
             self._render_text(event.text)
         elif isinstance(event, ToolCallStart):
@@ -242,13 +429,13 @@ class TUI:
     def _end_thinking(self) -> None:
         """结束 thinking 模式，换行以便后续内容另起一行。"""
         if self._in_thinking:
-            self._console.print()  # 结束 thinking 行
+            self._console.print()
             self._in_thinking = False
 
     def _render_thinking(self, text: str) -> None:
         """thinking 增量：灰色文字流式追加。"""
         if not self._in_thinking:
-            self._console.print()  # 另起一行
+            self._console.print()
             self._console.print("[dim]💭 ", end="")
             self._in_thinking = True
         self._console.print(text, end="", style="dim")
@@ -286,6 +473,7 @@ class TUI:
 
     def _handle_command(self, user_input: str) -> None:
         cmd = user_input.lower().strip()
+        parts = user_input.strip().split(maxsplit=1)
 
         if cmd in ("/exit", "/quit"):
             self._running = False
@@ -294,21 +482,7 @@ class TUI:
             self._console.print(Rule("对话已清空", style="dim"))
             self._console.print()
         elif cmd == "/help":
-            self._console.print()
-            self._console.print("可用命令：", style="bold")
-            self._console.print("  /exit, /quit      退出程序")
-            self._console.print("  /clear            清空对话历史")
-            self._console.print("  /plan-on          进入计划模式（只读，不执行写操作）")
-            self._console.print("  /plan-off         退出计划模式")
-            self._console.print("  /thinking-on      展示模型思考过程")
-            self._console.print("  /thinking-off     隐藏模型思考过程")
-            self._console.print("  /help             显示本帮助")
-            self._console.print()
-            self._console.print("快捷键：", style="bold")
-            self._console.print("  Esc               取消当前 Agent 循环")
-            self._console.print("  Ctrl+C            中断当前回复（兜底）")
-            self._console.print("  Ctrl+D / EOF      退出程序")
-            self._console.print()
+            self._print_help()
         elif cmd == "/plan-on":
             self._agent._config.plan_only = True
             self._console.print("[yellow]已进入 Plan-only 模式：只允许读操作，写操作将被拦截。[/]")
@@ -326,5 +500,83 @@ class TUI:
             self._config.show_thinking = False
             self._console.print("[yellow]已关闭思考过程展示。[/]")
             self._console.print()
+        elif parts[0] == "/mode":
+            self._handle_mode_command(parts)
+        elif cmd == "/revoke":
+            if self._agent._permission:
+                self._agent._permission.revoke_allow_all()
+                self._console.print('[yellow]已撤销本轮"全部允许"许可。[/]')
+            else:
+                self._console.print("[dim]权限系统未启用。[/]")
+            self._console.print()
+        elif cmd == "/perm":
+            self._print_perm_status()
         else:
             self._console.print(f"[red]未知命令: {user_input}[/]")
+
+    def _handle_mode_command(self, parts: list[str]) -> None:
+        """处理 /mode 命令。"""
+        if len(parts) == 1:
+            # /mode — 显示当前模式
+            if self._agent._permission:
+                mode = self._agent._permission.mode.value
+                self._console.print(f"[dim]当前权限模式: [bold]{mode}[/][/]")
+            else:
+                self._console.print("[dim]权限系统未启用。[/]")
+            self._console.print()
+            return
+
+        mode_str = parts[1].strip().lower()
+        if self._agent._permission is None:
+            self._console.print("[red]权限系统未启用，无法切换模式。[/]")
+            self._console.print()
+            return
+
+        try:
+            new_mode = PermissionMode.from_string(mode_str)
+            self._agent._permission.mode = new_mode
+            self._agent._permission.revoke_allow_all()
+
+            labels = {
+                PermissionMode.DEFAULT: "default — 读工具自动放行，写/Bash 需确认",
+                PermissionMode.ACCEPT_EDITS: "acceptEdits — 文件写自动放行，Bash 需确认",
+                PermissionMode.PLAN: "plan — 只允许读操作",
+            }
+            self._console.print(f"[green]已切换权限模式: {labels[new_mode]}[/]")
+        except ValueError as e:
+            self._console.print(f"[red]{e}[/]")
+        self._console.print()
+
+    def _print_perm_status(self) -> None:
+        """显示当前权限配置摘要。"""
+        self._console.print()
+        if self._agent._permission is None:
+            self._console.print("[dim]权限系统未启用[/]")
+        else:
+            pm = self._agent._permission
+            self._console.print("权限配置:", style="bold")
+            self._console.print(f"  模式: {pm.mode.value}")
+            self._console.print(f"  本轮全部允许: {'是' if pm.is_allow_all_active else '否'}")
+            self._console.print(f"  plan_only: {'是' if self._agent._config.plan_only else '否'}")
+        self._console.print()
+
+    def _print_help(self) -> None:
+        self._console.print()
+        self._console.print("可用命令：", style="bold")
+        self._console.print("  /exit, /quit      退出程序")
+        self._console.print("  /clear            清空对话历史")
+        self._console.print("  /plan-on          进入计划模式（只读，不执行写操作）")
+        self._console.print("  /plan-off         退出计划模式")
+        self._console.print("  /thinking-on      展示模型思考过程")
+        self._console.print("  /thinking-off     隐藏模型思考过程")
+        self._console.print("  /mode             显示当前权限模式")
+        self._console.print("  /mode <mode>      切换权限模式（default/acceptEdits/plan）")
+        self._console.print("  /revoke           撤销本轮全部允许")
+        self._console.print("  /perm             显示权限配置摘要")
+        self._console.print("  /help             显示本帮助")
+        self._console.print()
+        self._console.print("快捷键：", style="bold")
+        self._console.print("  Esc               取消当前 Agent 循环")
+        self._console.print("  Ctrl+C            中断当前回复（兜底）")
+        self._console.print("  Ctrl+D / EOF      退出程序")
+        self._console.print()

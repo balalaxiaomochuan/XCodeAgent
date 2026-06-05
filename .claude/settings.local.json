@@ -2,7 +2,12 @@
   "permissions": {
     "allow": [
       "Bash(uv pip:*)",
-      "Bash(uv run:*)"
+      "Bash(uv run:*)",
+      "WebSearch",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:opencode.ai)",
+      "Bash(uv sync:*)",
+      "Bash(D:/Projects/XCodeAgent/.venv/Scripts/python.exe:*)"
     ]
   }
 }
