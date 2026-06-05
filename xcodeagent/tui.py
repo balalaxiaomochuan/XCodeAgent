@@ -287,11 +287,8 @@ class TUI:
     async def _show_permission_dialog(
         self, request: PermissionRequest
     ) -> PermissionResponse:
-        """渲染权限确认对话框并等待用户输入。
+        """渲染权限确认对话框并用方向键选择决策。"""
 
-        Returns:
-            PermissionResponse: 用户决策。
-        """
         risk_colors = {
             "low": "green",
             "medium": "yellow",
@@ -300,10 +297,8 @@ class TUI:
         }
         risk_color = risk_colors.get(request.risk_level, "yellow")
 
-        # 命令分析
         analysis = analyze_tool_call(request.tool_name, request.tool_input)
 
-        # 提取关键参数摘要
         param_lines = []
         for k, v in request.tool_input.items():
             s = str(v)
@@ -336,23 +331,51 @@ class TUI:
         self._console.print()
         self._console.print(panel)
         self._console.print()
-        self._console.print(
-            f" [{risk_color}][Y][/] 允许本次  "
-            f"[bold red][N][/] 拒绝  "
-            f"[bold yellow][A][/] 本轮全部允许"
-        )
 
-        # 读取用户输入（单字符）
+        # ── 可方向键选择的选项菜单 ──
+        options = [
+            ("allow_once",  "允许本次",    "green"),
+            ("deny",        "拒绝",        "red"),
+            ("allow_all",   "本轮全部允许", "yellow"),
+        ]
+        selected = 0  # 默认选中"允许本次"
+
+        # Y/N/A 快捷键映射
+        shortcut_map = {"Y": 0, "N": 1, "A": 2}
+
         while True:
-            ch = await self._read_single_key()
-            ch = ch.upper() if ch else ""
-            if ch in ("Y", "N", "A"):
+            # 渲染选项行
+            parts = []
+            for i, (_, label, color) in enumerate(options):
+                if i == selected:
+                    parts.append(f"[bold white on {color}] ◀ {label} ▶ [/]")
+                else:
+                    parts.append(f"[{color}][{label}][/]")
+            self._console.print("  " + "  ".join(parts))
+            self._console.print()
+            self._console.print(
+                f"[dim]  ← → 选择  |  Enter 确认  |  Y/N/A 快捷键[/]"
+            )
+
+            # 读取按键
+            key = await self._read_key()
+
+            if key == "left":
+                selected = (selected - 1) % len(options)
+            elif key == "right":
+                selected = (selected + 1) % len(options)
+            elif key == "enter":
+                break
+            elif key.upper() in shortcut_map:
+                selected = shortcut_map[key.upper()]
                 break
 
-        decision_map = {"Y": "allow_once", "A": "allow_all", "N": "deny"}
-        decision = decision_map[ch]
+            # 清除选项行（上移 3 行: 选项行 + 空行 + 提示行）
+            sys.stdout.write("\033[3A\033[J")
+            sys.stdout.flush()
 
-        # 显示决策结果
+        decision = options[selected][0]
+
         result_text = {
             "allow_once": "[green]✓ 已允许本次执行[/]",
             "allow_all": "[yellow]✓ 已允许本轮全部执行[/]",
@@ -367,18 +390,28 @@ class TUI:
             decision=decision,
         )
 
-    async def _read_single_key(self) -> str:
-        """读取单个按键，跨平台兼容。"""
+    async def _read_key(self) -> str:
+        """读取单个按键，支持方向键（返回 'up'/'down'/'left'/'right'/'enter'）。"""
         if sys.platform == "win32":
             import msvcrt
             while True:
                 if msvcrt.kbhit():
                     ch = msvcrt.getch()
-                    try:
-                        return ch.decode("utf-8")
-                    except UnicodeDecodeError:
-                        return "?"
-                await asyncio.sleep(0.05)
+                    if ch == b'\xe0' or ch == b'\x00':
+                        # 方向键等扩展键
+                        ch2 = msvcrt.getch()
+                        return {
+                            b'H': 'up', b'P': 'down',
+                            b'K': 'left', b'M': 'right',
+                        }.get(ch2, '?')
+                    elif ch == b'\r':
+                        return 'enter'
+                    else:
+                        try:
+                            return ch.decode("utf-8")
+                        except UnicodeDecodeError:
+                            return '?'
+                await asyncio.sleep(0.03)
         else:
             import termios
             import tty
@@ -386,8 +419,20 @@ class TUI:
             old = termios.tcgetattr(fd)
             try:
                 tty.setcbreak(fd)
-                ch = await asyncio.to_thread(sys.stdin.read, 1)
-                return ch
+                while True:
+                    ch = await asyncio.to_thread(sys.stdin.read, 1)
+                    if ch == '\x1b':
+                        # 可能是 Escape 或方向键序列
+                        ch2 = await asyncio.to_thread(sys.stdin.read, 1)
+                        if ch2 == '[':
+                            ch3 = await asyncio.to_thread(sys.stdin.read, 1)
+                            return {'A': 'up', 'B': 'down',
+                                    'C': 'right', 'D': 'left'}.get(ch3, 'esc')
+                        return 'esc'
+                    elif ch in ('\r', '\n'):
+                        return 'enter'
+                    else:
+                        return ch
             finally:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
