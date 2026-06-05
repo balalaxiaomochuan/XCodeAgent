@@ -23,3 +23,6 @@ Thumbs.db
 
 # Prompt directory
 prompt/
+
+# Claude guidance file (keep local only)
+CLAUDE.md
