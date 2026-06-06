@@ -201,7 +201,9 @@ class TUI:
         # 清掉输入区域
         sys.stdout.write("\033[2A\033[J")
         sys.stdout.flush()
-        self._console.print(f"[bold bright_black]▸[/] [bright_black]{user_input}[/]")
+        self._console.print(
+            f"[bold bright_black]▸[/] [bright_black]{self._escape(user_input)}[/]"
+        )
         self._console.print()
 
         self._first_text = True
@@ -259,9 +261,9 @@ class TUI:
             cancel_token.set()
             self._console.print("\n[yellow]已中断当前回复[/]")
         except ProviderError as e:
-            self._console.print(f"\n[red]API 错误: {e}[/]")
+            self._console.print(f"\n[red]API 错误: {self._escape(str(e))}[/]")
         except Exception as e:
-            self._console.print(f"\n[red]Agent 错误: {e}[/]")
+            self._console.print(f"\n[red]Agent 错误: {self._escape(str(e))}[/]")
         finally:
             esc_task.cancel()
             collect_task.cancel()
@@ -299,27 +301,28 @@ class TUI:
 
         analysis = analyze_tool_call(request.tool_name, request.tool_input)
 
+        esc = self._escape
         param_lines = []
         for k, v in request.tool_input.items():
             s = str(v)
             if len(s) > 100:
                 s = s[:97] + "..."
-            param_lines.append(f"  {k}: {s}")
+            param_lines.append(f"  {esc(k)}: {esc(s)}")
 
         body_parts = [
-            f"[bold]工具:[/] {request.tool_name}",
-            f"[bold]用途:[/] [bold cyan]{analysis.summary}[/]",
-            f"[bold]影响:[/] {analysis.impact}",
+            f"[bold]工具:[/] {esc(request.tool_name)}",
+            f"[bold]用途:[/] [bold cyan]{esc(analysis.summary)}[/]",
+            f"[bold]影响:[/] {esc(analysis.impact)}",
         ]
         if analysis.risk_hint:
-            body_parts.append(f"[bold]⚠ 注意:[/] [yellow]{analysis.risk_hint}[/]")
+            body_parts.append(f"[bold]⚠ 注意:[/] [yellow]{esc(analysis.risk_hint)}[/]")
         body_parts += [
             "",
             f"[bold]参数:[/]",
             *param_lines,
             "",
-            f"[bold]风险级别:[/] [{risk_color}]{request.risk_level.upper()}[/]",
-            f"[bold]触发来源:[/] {request.source_description}",
+            f"[bold]风险级别:[/] [{risk_color}]{esc(request.risk_level.upper())}[/]",
+            f"[bold]触发来源:[/] {esc(request.source_description)}",
         ]
 
         panel = Panel(
@@ -327,6 +330,7 @@ class TUI:
             title="[bold]⚠ 确认工具调用[/]",
             border_style=risk_color,
             padding=(1, 2),
+            safe_box=True,
         )
         self._console.print()
         self._console.print(panel)
@@ -467,9 +471,14 @@ class TUI:
             elif event.reason == "continue":
                 self._console.print("[dim]  thinking...[/]")
         elif isinstance(event, AgentError):
-            self._console.print(f"\n[red]⚠ {event.message}[/]")
+            self._console.print(f"\n[red]⚠ {self._escape(event.message)}[/]")
 
     # ── 事件渲染方法 ──────────────────────────────────────
+
+    @staticmethod
+    def _escape(s: str) -> str:
+        """转义字符串中的 Rich markup 特殊字符，避免 LLM 输出被误解析。"""
+        return s.replace("[", "\\[")
 
     def _end_thinking(self) -> None:
         """结束 thinking 模式，换行以便后续内容另起一行。"""
@@ -483,21 +492,23 @@ class TUI:
             self._console.print()
             self._console.print("[dim]💭 ", end="")
             self._in_thinking = True
-        self._console.print(text, end="", style="dim")
+        self._console.print(self._escape(text), end="", style="dim")
 
     def _render_text(self, text: str) -> None:
-        """文本增量：正常颜色流式追加。"""
+        """文本增量：正常颜色流式追加（禁用 Rich markup 防止 LLM 输出被误解析）。"""
         if self._first_text:
             self._first_text = False
-            self._console.print("[bold cyan]│[/] ", end="")
-        self._console.print(text, end="")
+            self._console.print("[bold cyan]|[/] ", end="")
+        self._console.print(self._escape(text), end="")
 
     def _render_tool_start(self, name: str, tool_input: dict) -> None:
         """工具调用开始：工具名 + 参数摘要。"""
         input_preview = ", ".join(f"{k}={v}" for k, v in tool_input.items())
         if len(input_preview) > 60:
             input_preview = input_preview[:57] + "..."
-        self._console.print(f"\n[bold cyan]  ⚡ {name}[/] [dim]({input_preview})[/]")
+        self._console.print(
+            f"\n[bold cyan]  ⚡ {name}[/] [dim]({self._escape(input_preview)})[/]"
+        )
 
     def _render_tool_end(
         self, name: str, success: bool, output: str, error: str | None
@@ -507,12 +518,16 @@ class TUI:
             first_line = output.split("\n")[0] if output else "(empty)"
             if len(first_line) > 80:
                 first_line = first_line[:77] + "..."
-            self._console.print(f"[bold green]  ✅ {first_line}[/]")
+            self._console.print(
+                f"[bold green]  ✅ {self._escape(first_line)}[/]"
+            )
         else:
             err = error or "unknown"
             if len(err) > 80:
                 err = err[:77] + "..."
-            self._console.print(f"[bold red]  ❌ {err}[/]")
+            self._console.print(
+                f"[bold red]  ❌ {self._escape(err)}[/]"
+            )
 
     # ── 命令处理 ──────────────────────────────────────────
 
@@ -557,7 +572,7 @@ class TUI:
         elif cmd == "/perm":
             self._print_perm_status()
         else:
-            self._console.print(f"[red]未知命令: {user_input}[/]")
+            self._console.print(f"[red]未知命令: {self._escape(user_input)}[/]")
 
     def _handle_mode_command(self, parts: list[str]) -> None:
         """处理 /mode 命令。"""
@@ -589,7 +604,7 @@ class TUI:
             }
             self._console.print(f"[green]已切换权限模式: {labels[new_mode]}[/]")
         except ValueError as e:
-            self._console.print(f"[red]{e}[/]")
+            self._console.print(f"[red]{self._escape(str(e))}[/]")
         self._console.print()
 
     def _print_perm_status(self) -> None:

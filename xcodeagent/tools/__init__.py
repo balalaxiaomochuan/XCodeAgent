@@ -1,4 +1,4 @@
-"""工具子系统：注册中心 + 执行引擎 + 六个工具。"""
+"""工具子系统：注册中心 + 执行引擎 + 八个工具。"""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from xcodeagent.tools.edit_file import EditFile
 from xcodeagent.tools.bash_ import Bash
 from xcodeagent.tools.glob_ import Glob
 from xcodeagent.tools.grep_ import Grep
+from xcodeagent.tools.web_search import WebSearch
+from xcodeagent.tools.web_fetch import WebFetch
 
 
 def create_tool_executor(
@@ -20,7 +22,7 @@ def create_tool_executor(
     default_timeout: float = 30.0,
     bash_timeout: float = 120.0,
 ) -> ToolExecutor:
-    """创建预设所有 6 个工具的 ToolExecutor。
+    """创建预设所有 8 个工具的 ToolExecutor。
 
     Args:
         project_root: 项目根目录（所有路径操作的边界）。
@@ -39,6 +41,8 @@ def create_tool_executor(
     registry.register(Bash(root))
     registry.register(Glob(root))
     registry.register(Grep(root))
+    registry.register(WebSearch(root))
+    registry.register(WebFetch(root))
 
     return ToolExecutor(registry, default_timeout=default_timeout)
 
@@ -54,5 +58,7 @@ __all__ = [
     "Bash",
     "Glob",
     "Grep",
+    "WebSearch",
+    "WebFetch",
     "create_tool_executor",
 ]
