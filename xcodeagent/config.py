@@ -32,6 +32,7 @@ class AppConfig:
     extended_thinking: Optional[ExtendedThinkingConfig] = None
     show_thinking: bool = True
     permissions: PermissionConfig = field(default_factory=PermissionConfig)
+    mcp_servers: dict = field(default_factory=dict)
 
 
 def _default_config_path() -> Path:
@@ -137,6 +138,16 @@ def load_config(path: str | Path) -> AppConfig:
     # 解析权限配置
     permissions = _load_permission_config(data)
 
+    # ── 解析 MCP Server 配置（两层合并）────────────────────
+    user_mcp_servers = _load_user_mcp_servers()
+    project_mcp_servers = data.get("mcpServers")
+    # 同名 Server 项目级覆盖用户级
+    mcp_servers: dict = {}
+    if user_mcp_servers:
+        mcp_servers.update(user_mcp_servers)
+    if project_mcp_servers:
+        mcp_servers.update(project_mcp_servers)
+
     return AppConfig(
         protocol=protocol,
         model=data["model"],
@@ -145,7 +156,21 @@ def load_config(path: str | Path) -> AppConfig:
         extended_thinking=ext_thinking,
         show_thinking=data.get("show_thinking", True),
         permissions=permissions,
+        mcp_servers=mcp_servers,
     )
+
+
+def _load_user_mcp_servers() -> dict | None:
+    """从用户级配置文件加载 MCP Server 列表。"""
+    user_path = _default_config_path()
+    if not user_path.exists():
+        return None
+    try:
+        with open(user_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data.get("mcpServers")
 
 
 def create_default_config(path: str | Path) -> None:
@@ -167,6 +192,7 @@ def create_default_config(path: str | Path) -> None:
             "prepend_rules": False,
             "dangerous_commands_extra": [],
         },
+        "mcpServers": {},
     }
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

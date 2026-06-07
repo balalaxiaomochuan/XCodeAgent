@@ -6,5 +6,6 @@
   "extended_thinking": {
     "enabled": false,
     "budget_tokens": 4000
-  }
+  },
+  "mcpServers": {}
 }

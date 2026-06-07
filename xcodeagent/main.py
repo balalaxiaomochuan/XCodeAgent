@@ -11,6 +11,8 @@ from pathlib import Path
 from xcodeagent.agent import Agent, AgentConfig
 from xcodeagent.chat import ChatSession
 from xcodeagent.config import ConfigError, _default_config_path, create_default_config, load_config
+from xcodeagent.mcp.config import parse_mcp_servers
+from xcodeagent.mcp.manager import MCPManager
 from xcodeagent.permission import PermissionManager
 from xcodeagent.provider import create_provider
 from xcodeagent.tools import create_tool_executor
@@ -23,7 +25,7 @@ SYSTEM_PROMPT = """\
 你的名字是 XCodeAgent，一个由蟑螂恶霸开发的命令行 AI 编程助手。
 
 ## 核心能力
-- 你拥有八个工具：ReadFile（读文件）、WriteFile（写文件）、EditFile（编辑文件）、Bash（执行命令）、Glob（搜索文件）、Grep（搜索内容）、WebSearch（网页搜索）、WebFetch（获取网页内容）。
+- 你拥有多个工具：ReadFile（读文件）、WriteFile（写文件）、EditFile（编辑文件）、Bash（执行命令）、Glob（搜索文件）、Grep（搜索内容）、WebSearch（网页搜索）、WebFetch（获取网页内容），以及可能来自外部 MCP Server 的工具。
 - 你可以自主推理——先读代码了解现状，再决定如何修改，最后执行并验证。
 
 ## 行为准则
@@ -65,6 +67,63 @@ def _fix_windows_encoding() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass  # 非控制台场景（管道重定向等），保持默认
+
+
+async def _run(
+    project_root: Path,
+    config,
+    provider,
+) -> None:
+    """统一异步入口：在同一事件循环中依次完成 MCP 连接、工具注册、TUI 运行。
+
+    MCP Server 子进程（StdioTransport）必须在与工具调用相同的事件循环中创建，
+    否则 asyncio.subprocess.Process 的底层管道 transport 会在旧循环关闭后失效，
+    在 Windows ProactorEventLoop 下表现为 'NoneType' object has no attribute 'send'。
+    """
+    # ── MCP: 连接外部 Server，发现工具 ──────────────────────────
+    mcp_servers = parse_mcp_servers(config.mcp_servers)
+    mcp_manager: MCPManager | None = None
+    mcp_tools: list | None = None
+    if mcp_servers:
+        print(f"[MCP] 正在连接 {len(mcp_servers)} 个 MCP Server...")
+        mcp_manager = MCPManager(mcp_servers, project_root)
+        await mcp_manager.start()
+        mcp_tools = mcp_manager.get_tools()
+
+    tool_executor = create_tool_executor(
+        project_root=project_root,
+        mcp_tools=mcp_tools,
+    )
+
+    chat_session = ChatSession(
+        provider=provider,
+        model=config.model,
+        system_prompt=SYSTEM_PROMPT,
+        extended_thinking=config.extended_thinking,
+    )
+
+    agent_config = AgentConfig(
+        max_rounds=50,
+        plan_only=False,
+        tool_timeout=120.0,
+    )
+
+    permission_manager = PermissionManager(
+        project_root=project_root,
+        config=config.permissions,
+    )
+
+    agent = Agent(chat_session, tool_executor, agent_config, permission_manager)
+
+    tui = TUI(agent, chat_session, config, project_root=project_root)
+
+    try:
+        await tui.run()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        if mcp_manager:
+            await mcp_manager.stop()
 
 
 def main():
@@ -111,34 +170,9 @@ def main():
     provider = create_provider(config)
 
     project_root = Path(os.getcwd())
-    tool_executor = create_tool_executor(project_root=project_root)
 
-    chat_session = ChatSession(
-        provider=provider,
-        model=config.model,
-        system_prompt=SYSTEM_PROMPT,
-        extended_thinking=config.extended_thinking,
-    )
-
-    agent_config = AgentConfig(
-        max_rounds=20,
-        plan_only=False,
-        tool_timeout=120.0,
-    )
-
-    permission_manager = PermissionManager(
-        project_root=project_root,
-        config=config.permissions,
-    )
-
-    agent = Agent(chat_session, tool_executor, agent_config, permission_manager)
-
-    tui = TUI(agent, chat_session, config, project_root=project_root)
-
-    try:
-        asyncio.run(tui.run())
-    except KeyboardInterrupt:
-        print()
+    # ── 主入口：所有异步操作统一在同一事件循环中执行 ──────────
+    asyncio.run(_run(project_root, config, provider))
 
 
 if __name__ == "__main__":

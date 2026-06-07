@@ -36,7 +36,7 @@ from xcodeagent.tools.executor import ToolExecutor
 @dataclass
 class AgentConfig:
     """Agent 行为配置。"""
-    max_rounds: int = 20
+    max_rounds: int = 50
     plan_only: bool = False
     tool_timeout: float = 120.0
 
@@ -301,14 +301,19 @@ class Agent:
 
     # ── 工具分组 ─────────────────────────────────────────────
 
-    @staticmethod
     def _partition_tools(
+        self,
         tool_calls: list[ProviderToolCall],
     ) -> tuple[list[ProviderToolCall], list[ProviderToolCall]]:
-        """按 category 分组工具调用。"""
+        """按 category 分组工具调用：读工具并发、写工具串行。"""
         reads, writes = [], []
         for tc in tool_calls:
-            if tc.name in ("read_file", "glob", "grep"):
+            try:
+                tool = self._executor.registry.get(tc.name)
+                category = tool.category
+            except KeyError:
+                category = "write"  # 未知工具保守当写处理
+            if category == "read":
                 reads.append(tc)
             else:
                 writes.append(tc)

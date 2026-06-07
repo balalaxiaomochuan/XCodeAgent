@@ -21,13 +21,15 @@ def create_tool_executor(
     project_root: str | Path,
     default_timeout: float = 30.0,
     bash_timeout: float = 120.0,
+    mcp_tools: list[BaseTool] | None = None,
 ) -> ToolExecutor:
-    """创建预设所有 8 个工具的 ToolExecutor。
+    """创建预设所有内置工具和可选 MCP 工具的 ToolExecutor。
 
     Args:
         project_root: 项目根目录（所有路径操作的边界）。
         default_timeout: 默认超时秒数（除 Bash 外的工具）。
         bash_timeout: Bash 工具的默认超时秒数。
+        mcp_tools: 可选，从 MCP Server 发现的工具列表。
 
     Returns:
         配置好的 ToolExecutor 实例。
@@ -43,6 +45,15 @@ def create_tool_executor(
     registry.register(Grep(root))
     registry.register(WebSearch(root))
     registry.register(WebFetch(root))
+
+    # 注册 MCP 工具
+    if mcp_tools:
+        for tool in mcp_tools:
+            try:
+                registry.register(tool)
+            except ValueError as e:
+                import sys
+                print(f"[WARNING] MCP 工具冲突: {e}", file=sys.stderr)
 
     return ToolExecutor(registry, default_timeout=default_timeout)
 
