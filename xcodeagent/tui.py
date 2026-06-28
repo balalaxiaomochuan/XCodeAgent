@@ -139,7 +139,7 @@ class TUI:
                 continue
 
             if user_input.startswith("/"):
-                self._handle_command(user_input)
+                await self._handle_command(user_input)
                 continue
 
             await self._handle_chat(user_input)
@@ -531,7 +531,7 @@ class TUI:
 
     # ── 命令处理 ──────────────────────────────────────────
 
-    def _handle_command(self, user_input: str) -> None:
+    async def _handle_command(self, user_input: str) -> None:
         cmd = user_input.lower().strip()
         parts = user_input.strip().split(maxsplit=1)
 
@@ -571,6 +571,8 @@ class TUI:
             self._console.print()
         elif cmd == "/perm":
             self._print_perm_status()
+        elif cmd == "/compact":
+            await self._handle_compact_command()
         else:
             self._console.print(f"[red]未知命令: {self._escape(user_input)}[/]")
 
@@ -620,6 +622,29 @@ class TUI:
             self._console.print(f"  plan_only: {'是' if self._agent._config.plan_only else '否'}")
         self._console.print()
 
+    async def _handle_compact_command(self) -> None:
+        """处理 /compact 命令：手动触发对话历史压缩。"""
+        ctx = self._agent._context_manager
+        if ctx is None:
+            self._console.print("[dim]上下文管理器未启用。[/]")
+            self._console.print()
+            return
+
+        self._console.print("[dim]正在压缩对话历史...[/]")
+        result = await ctx.compact_now(self._chat)
+        if result.degraded:
+            self._console.print(
+                f"[red]压缩失败: {self._escape(result.error_message)}[/]"
+            )
+        elif result.compacted:
+            self._console.print(
+                f"[green]压缩完成: {result.messages_before} → {result.messages_after} 条消息, "
+                f"{result.tokens_before} → {result.tokens_after} tokens[/]"
+            )
+        else:
+            self._console.print("[dim]未触发压缩。[/]")
+        self._console.print()
+
     def _print_help(self) -> None:
         self._console.print()
         self._console.print("可用命令：", style="bold")
@@ -633,6 +658,7 @@ class TUI:
         self._console.print("  /mode <mode>      切换权限模式（default/acceptEdits/plan）")
         self._console.print("  /revoke           撤销本轮全部允许")
         self._console.print("  /perm             显示权限配置摘要")
+        self._console.print("  /compact          立即压缩对话历史上下文")
         self._console.print("  /help             显示本帮助")
         self._console.print()
         self._console.print("快捷键：", style="bold")

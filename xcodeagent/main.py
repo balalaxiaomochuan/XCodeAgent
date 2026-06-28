@@ -11,6 +11,7 @@ from pathlib import Path
 from xcodeagent.agent import Agent, AgentConfig
 from xcodeagent.chat import ChatSession
 from xcodeagent.config import ConfigError, _default_config_path, create_default_config, load_config
+from xcodeagent.context import ContextManager
 from xcodeagent.mcp.config import parse_mcp_servers
 from xcodeagent.mcp.manager import MCPManager
 from xcodeagent.permission import PermissionManager
@@ -113,7 +114,18 @@ async def _run(
         config=config.permissions,
     )
 
-    agent = Agent(chat_session, tool_executor, agent_config, permission_manager)
+    # ── 上下文管理器（两层压缩） ──
+    session_dir = project_root / ".xcodeagent" / "session"
+    context_manager = ContextManager(
+        provider=provider,
+        model=config.model,
+        session_dir=session_dir,
+    )
+
+    agent = Agent(
+        chat_session, tool_executor, agent_config, permission_manager,
+        context_manager=context_manager,
+    )
 
     tui = TUI(agent, chat_session, config, project_root=project_root)
 

@@ -6,11 +6,14 @@
 
 ## 功能特性
 
-- **ReAct 自主推理**：Agent 会先思考 → 调用工具 → 拿到结果 → 再思考，最多支持 20 轮循环
-- **六大工具**：读文件（ReadFile）、写文件（WriteFile）、编辑文件（EditFile）、执行命令（Bash）、搜索文件（Glob）、搜索内容（Grep）
+- **ReAct 自主推理**：Agent 会先思考 → 调用工具 → 拿到结果 → 再思考，最多支持 50 轮循环
+- **八大工具**：读文件、写文件、编辑文件、执行命令、搜索文件、搜索内容、网页搜索、网页抓取
+- **MCP 扩展**：通过 Model Context Protocol 自动发现并接入外部工具，支持 stdio 和 Streamable HTTP 双传输
+- **上下文管理**：两层压缩机制 —— 超大工具结果自动存盘 + 对话历史智能摘要，突破上下文窗口限制
 - **多 LLM 后端**：同时支持 Anthropic Claude 和 OpenAI 两种协议
 - **流式输出**：实时显示 AI 的思考过程和文本生成
 - **Extended Thinking**：支持 Claude Extended Thinking，展示深度推理过程
+- **智能输入**：基于 prompt_toolkit 的终端输入，支持斜杠命令补全、@ 文件引用、历史记录导航
 - **五层权限安全系统**：高危命令拦截 → 路径沙箱 → 规则引擎 → 权限模式 → 确认对话框
 - **Plan-only 模式**：只读不写，安全审查 AI 的修改计划
 - **终端 TUI**：基于 Rich 的终端界面，支持斜杠命令和 Esc 取消
@@ -34,9 +37,8 @@ XCodeAgent/
 │   ├── agent.py                # ReAct Agent 主循环
 │   ├── events.py               # AgentEvent 事件类型体系
 │   ├── tui.py                  # 基于 Rich 的终端界面
-│   ├── input_ui.py             # 输入 UI 模块
+│   ├── input_ui.py             # 智能输入模块（prompt_toolkit）
 │   ├── command_analyzer.py     # 命令分析器
-│   ├── client.py               # 客户端占位文件
 │   ├── provider/               # LLM 供应商抽象层
 │   │   ├── __init__.py         # 工厂函数 create_provider()
 │   │   ├── base.py             # 抽象基类 + Delta 类型
@@ -52,7 +54,22 @@ XCodeAgent/
 │   │   ├── edit_file.py        # EditFile 精确编辑工具
 │   │   ├── bash_.py            # Bash 命令执行工具
 │   │   ├── glob_.py            # Glob 文件搜索工具
-│   │   └── grep_.py            # Grep 内容搜索工具
+│   │   ├── grep_.py            # Grep 内容搜索工具
+│   │   ├── web_search.py       # WebSearch 网页搜索工具
+│   │   └── web_fetch.py        # WebFetch 网页抓取工具
+│   ├── mcp/                    # MCP 扩展子系统
+│   │   ├── __init__.py         # 公开 API
+│   │   ├── protocol.py         # JSON-RPC 2.0 消息协议
+│   │   ├── transport.py        # Stdio + HTTP 双传输
+│   │   ├── client.py           # MCPClient 单 Server 会话
+│   │   ├── manager.py          # MCPManager 多 Server 管理 + 工具适配
+│   │   └── config.py           # MCP 配置解析 + 环境变量展开
+│   ├── context/                # 上下文管理子系统
+│   │   ├── __init__.py         # 公开 ContextManager
+│   │   ├── counter.py          # Token 保守估算
+│   │   ├── offloader.py        # 第一层：工具结果磁盘卸载 + 决策冻结
+│   │   ├── summarizer.py       # 第二层：LLM 对话摘要生成
+│   │   └── manager.py          # 编排两层压缩的统一入口
 │   └── permission/             # 权限安全系统
 │       ├── __init__.py         # 公开 API + 配置数据类
 │       ├── manager.py          # PermissionManager 权限管理器
@@ -61,7 +78,7 @@ XCodeAgent/
 │       ├── path_sandbox.py     # 路径沙箱
 │       └── dangerous_cmds.py   # 高危命令黑名单
 └── prompt/                     # 开发规划文档（gitignored）
-    ├── ch02/ ~ ch06/           # 各阶段 spec / tasks / checklist
+    ├── ch02/ ~ ch08/           # 各阶段 spec / tasks / checklist
 ```
 
 ## 环境要求
@@ -115,7 +132,8 @@ uv run xcodeagent --init --global
     "rules": [],
     "prepend_rules": false,
     "dangerous_commands_extra": []
-  }
+  },
+  "mcpServers": {}
 }
 ```
 
@@ -128,6 +146,7 @@ uv run xcodeagent --init --global
 | `show_thinking` | 是否显示 AI 思考过程 |
 | `extended_thinking` | Claude Extended Thinking 配置 |
 | `permissions.mode` | 权限模式：`default` / `acceptEdits` / `plan` |
+| `mcpServers` | MCP Server 配置（详见下方 MCP 扩展章节） |
 
 ### 5. 启动
 
@@ -200,7 +219,7 @@ XCodeAgent 启动时会按以下顺序查找配置文件：
 
 这意味着你可以在不同项目中拥有不同的配置（模型、权限规则等），同时在全局保留一个默认配置作为兜底。
 
-## 六大工具
+## 内置工具
 
 | 工具 | 分类 | 用途 | 关键行为 |
 |------|------|------|---------|
@@ -210,8 +229,94 @@ XCodeAgent 启动时会按以下顺序查找配置文件：
 | Bash | write | 执行 shell 命令 | 子进程隔离，默认 120s 超时 |
 | Glob | read | 通配符搜文件 | Path.rglob，排除 .git/.venv |
 | Grep | read | 正则搜内容 | re 模块，排除二进制文件 |
+| WebSearch | read | 网页搜索 | 返回搜索结果标题和 URL |
+| WebFetch | read | 网页内容抓取 | 将网页转为 Markdown 格式 |
 
-Agent 会自动分组执行：读工具（ReadFile/Glob/Grep）并发执行，写工具（WriteFile/EditFile/Bash）串行执行，每个写操作经过权限检查。
+Agent 会自动分组执行：读工具（ReadFile/Glob/Grep/WebSearch/WebFetch 等）并发执行，写工具（WriteFile/EditFile/Bash）串行执行，每个写操作经过权限检查。
+
+## MCP 扩展
+
+通过 Model Context Protocol（MCP），XCodeAgent 可以在启动时自动发现并接入外部 MCP Server 提供的工具，无缝扩展能力边界。
+
+### 配置 MCP Server
+
+在 `config.json` 中添加 `mcpServers` 字段：
+
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-server-filesystem", "/path/to/dir"],
+      "env": {
+        "NODE_PATH": "${HOME}/.npm-global"
+      }
+    },
+    "remote-search": {
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${MCP_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+### 支持的传输方式
+
+| 方式 | 字段 | 适用场景 |
+|------|------|---------|
+| stdio | `command` + `args` + `env`（可选） | 本地子进程 MCP Server，通过 stdin/stdout 通信 |
+| HTTP | `url` + `headers`（可选） | 远程 MCP Server，通过 HTTP POST 通信 |
+
+- 环境变量值支持 `${VAR}` 和 `$VAR` 两种展开方式
+- 配置支持两层合并：用户级 `~/.xcodeagent/config.json` 和项目级 `./config.json`，同名 Server 项目级覆盖用户级
+
+### 设计原则
+
+- **故障隔离**：单个 MCP Server 连接失败不会影响其他 Server 和整体启动
+- **无感适配**：外部工具以相同接口接入 Agent，调用方式与内置工具完全一致
+- **工具名冲突检测**：MCP 工具与内置工具重名时自动跳过并输出警告
+
+## 上下文管理
+
+在长期对话中，Agent 的消息历史持续增长，其中工具调用结果约占总 token 的 80%。XCodeAgent 实现了两层压缩机制来突破上下文窗口限制：
+
+### 第一层：工具结果磁盘卸载
+
+| 阈值 | 触发条件 | 行为 |
+|------|---------|------|
+| 单工具 | 单个结果 > 50,000 字符 | 完整内容存入 `.xcodeagent/session/tool-results/`，对话中替换为预览 + 文件路径 |
+| 聚合 | 单轮所有结果 > 200,000 字符 | 从最大结果开始卸载，直到总量低于预算 |
+
+**决策冻结**：每个工具结果的"替换 / 保留"决定在整个会话中只做一次。后续轮次直接复用缓存的预览字符串，确保 Prompt Cache 前缀逐字符不变。
+
+### 第二层：Auto-Compact
+
+```
+上下文窗口 (200,000)
+  - 摘要输出预留 (20,000)    ← 摘要本身的 prompt + 输出
+  - 安全余量 (13,000)        ← 防止检查通过后新增内容击穿窗口
+  = 自动压缩阈值 (167,000)
+```
+
+当 token 数超过阈值时，系统自动调用 LLM 生成 **9 部分结构化摘要**：
+
+1. 主要请求和意图
+2. 关键技术概念
+3. 文件和代码段
+4. 错误和修复
+5. 问题解决过程
+6. 所有用户消息（原文保留！）
+7. 待办任务
+8. 当前工作（最详细）
+9. 可能的下一步
+
+摘要生成采用**两阶段模式**（先 `<analysis>` 草稿再 `<summary>` 正式块），同时保留 system prompt 和近期原文（至少 5 条，保证 tool_use/tool_result 配对完整）。
+
+### 手动压缩
+
+使用 `/compact` 命令可以随时主动触发全量对话压缩。
 
 ## TUI 命令
 
@@ -224,11 +329,23 @@ Agent 会自动分组执行：读工具（ReadFile/Glob/Grep）并发执行，�
 | `/exit` 或 `/quit` | 退出程序 |
 | `/plan-on` | 开启 Plan-only 模式（只读不写） |
 | `/plan-off` | 关闭 Plan-only 模式 |
+| `/thinking-on` | 展示模型思考过程 |
+| `/thinking-off` | 隐藏模型思考过程 |
+| `/mode` | 显示当前权限模式 |
+| `/mode <模式>` | 切换权限模式（`default` / `acceptEdits` / `plan`） |
+| `/revoke` | 撤销本轮全部允许 |
+| `/perm` | 显示权限配置摘要 |
+| `/compact` | 立即压缩对话历史上下文 |
 
 快捷键：
 
-- **Esc**：取消当前 Agent 循环
+- **↑↓**：浏览输入历史
+- **Tab**：触发 / 指令或 @ 文件补全
+- **/**：自动弹出斜杠命令补全菜单
+- **@**：自动弹出项目文件引用补全菜单
+- **Esc**：取消当前 Agent 循环 / 关闭补全菜单
 - **Ctrl+C**：兜底中断程序
+- **Ctrl+D**：退出程序
 
 ## 权限安全系统
 
@@ -251,13 +368,15 @@ Agent 会自动分组执行：读工具（ReadFile/Glob/Grep）并发执行，�
 ## 架构数据流
 
 ```
-用户输入 → TUI → Agent.run() → provider.chat_with_tools()
+用户输入 → TUI → Agent.run()
+    → 上下文检查（第一层卸载 + 第二层 auto-compact）
+    → provider.chat_with_tools()
     → 流式渲染文本/思考过程
     → 工具调用分组（读并发、写串行）
     → 权限检查（写工具）
-    → 执行工具
+    → 执行工具（内置工具 + MCP 外部工具统一接口）
     → 结果回填 LLM
-    → 下一轮循环（最多 20 轮）
+    → 下一轮循环（最多 50 轮）
     → 最终回复
 ```
 

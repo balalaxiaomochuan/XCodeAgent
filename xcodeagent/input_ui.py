@@ -33,6 +33,7 @@ COMMANDS: dict[str, str] = {
     "/mode plan":         "切换权限模式: plan（仅读操作）",
     "/revoke":            "撤销本轮全部允许",
     "/perm":              "显示权限配置摘要",
+    "/compact":           "立即压缩对话历史上下文",
     "/help":              "显示帮助信息",
 }
 

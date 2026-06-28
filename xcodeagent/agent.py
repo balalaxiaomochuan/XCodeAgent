@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass, field
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator
 
 from xcodeagent.chat import ChatSession
 from xcodeagent.events import (
@@ -28,6 +28,9 @@ from xcodeagent.provider.base import ThinkingDelta as ProviderThinkingDelta
 from xcodeagent.provider.base import ToolCall as ProviderToolCall
 from xcodeagent.tools.base import ToolResult
 from xcodeagent.tools.executor import ToolExecutor
+
+if TYPE_CHECKING:
+    from xcodeagent.context import ContextManager
 
 
 # ── 配置 ──────────────────────────────────────────────────────
@@ -57,11 +60,13 @@ class Agent:
         tool_executor: ToolExecutor,
         config: AgentConfig | None = None,
         permission_manager: PermissionManager | None = None,
+        context_manager: "ContextManager | None" = None,
     ):
         self._chat = chat_session
         self._executor = tool_executor
         self._config = config or AgentConfig()
         self._permission = permission_manager
+        self._context_manager = context_manager
 
         # Agent → TUI 的权限请求通道
         self._perm_request_queue: asyncio.Queue[PermissionRequest] = asyncio.Queue()
@@ -93,11 +98,21 @@ class Agent:
         if self._permission:
             self._permission.reset_round()
 
+        # 追踪上一轮的工具 ID，用于上下文压缩第一层检查
+        prev_tool_ids: list[str] = []
+
         for round_num in range(1, self._config.max_rounds + 1):
             # ── 检查外部取消 ──
             if cancel_token and cancel_token.is_set():
                 yield TurnEnd(round_number=round_num, reason="cancelled")
                 break
+
+            # ── 上下文检查：第一层卸载 + 第二层 auto-compact ──
+            if self._context_manager:
+                await self._context_manager.pre_round_check(
+                    self._chat, round_num, prev_tool_ids
+                )
+                prev_tool_ids = []
 
             yield TurnStart(round_number=round_num)
 
@@ -185,6 +200,9 @@ class Agent:
                     "tool_use_id": tc.id,
                     "content": content,
                 })
+
+            # 记录本轮工具 ID，供下一轮上下文检查
+            prev_tool_ids = [tc.id for tc in tool_calls]
 
             if tool_result_blocks:
                 self._chat.messages.append({

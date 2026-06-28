@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(mkdir -p D:/Projects/XCodeAgent/prompt/ch08)",
+      "Bash(uv run *)"
+    ],
+    "additionalDirectories": [
+      "D:\\Projects\\XCodeAgent\\prompt"
+    ]
+  }
+}

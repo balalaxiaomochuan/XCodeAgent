@@ -26,3 +26,6 @@ prompt/
 
 # Claude guidance file (keep local only)
 CLAUDE.md
+
+# notebook
+.note/
